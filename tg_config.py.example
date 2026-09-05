@@ -1,0 +1,32 @@
+"""
+Telegram configuration for frigate_bot
+Just uncomment the option you need
+"""
+
+# --- TELEGRAM MODES ---
+# Which protocols to use: 'BOT' (Bot API) and/or 'MTPROTO' (Telethon)
+TELEGRAM_MODES = ['BOT']
+# TELEGRAM_MODES = ['MTPROTO']
+# TELEGRAM_MODES = ['BOT', 'MTPROTO']
+
+# --- BOT API CONFIGURATION ---
+# Just uncomment the one you need
+BOT_CONFIG = {
+    "token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+    "chat_id": -1234567890  # First chat
+}
+
+# BOT_CONFIG = {
+#     "token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+#     "chat_id": -9876543210  # Second chat
+# }
+
+# --- MTPROTO CONFIGURATION (Telethon) ---
+# Get api_id and api_hash from https://my.telegram.org/apps
+MTPROTO_CONFIG = {
+    "api_id": 123456,
+    "api_hash": 'abcdef1234567890abcdef1234567890',
+    "session_name": 'frigate_session',
+    "chat_id": -1234567890
+}
+

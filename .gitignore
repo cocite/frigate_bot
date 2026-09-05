@@ -1,0 +1,23 @@
+# Telegram credentials
+tg_config.py
+
+# Telethon sessions
+*.session
+*.session-journal
+
+# Logs
+*.log
+*.log.*
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Runtime data (snapshots, videos)
+data/
+
+# Local debug tooling
+replay.sh

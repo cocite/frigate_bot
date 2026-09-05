@@ -1,0 +1,4 @@
+aiomqtt
+paho-mqtt
+requests
+telethon

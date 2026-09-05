@@ -1,0 +1,36 @@
+# Пример интеграции frigate_bot в существующий docker-compose с Frigate.
+#
+# Бот ходит к сервисам `frigate` и `mosquitto` по этим именам
+# (frigate:5000 и mosquitto:1883), они должны быть в том же compose.
+
+services:
+
+  frigate_bot:
+    container_name: frigate_bot
+    build:
+      context: ./frigate_bot
+    restart: unless-stopped
+
+    # Обе секции ниже (environment + devices) нужны только для аппаратного
+    # кодирования видео (VAAPI) на Intel iGPU (Broadwell / Core 5xxx и новее).
+    # /dev/dri — стандартный путь GPU-устройств ядра Linux, одинаков во всех дистрибутивах.
+    # Если убрать — бот сам перейдёт на CPU-кодирование (libx264),
+    # предупреждая об этом в логе на каждом событии.
+    environment:
+      LIBVA_DRIVER_NAME: iHD
+    devices:
+      - /dev/dri:/dev/dri
+    # Если VAAPI не заводится без привилегий — раскомментируй:
+    # privileged: true
+
+    volumes:
+      # Код бота: живой с хоста, правки подхватываются рестартом без пересборки
+      - ./frigate_bot:/app
+      # Медиатека Frigate — только чтение, отсюда бот забирает готовые экспорты.
+      # Путь слева должен совпадать с тем, что смонтирован в сервисе frigate.
+      - ./media/frigate:/media/frigate:ro
+      # Часовой пояс хоста — чтобы время в подписях совпадало с реальностью
+      - /etc/localtime:/etc/localtime:ro
+
+    depends_on:
+      - mosquitto

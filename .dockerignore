@@ -1,0 +1,22 @@
+# Логи (большие и меняются постоянно — ломают кеш сборки)
+*.log
+*.log.*
+
+# Сессии Telethon (в образе им не место, придут через bind mount)
+*.session
+*.session-journal
+
+# Python
+__pycache__/
+*.pyc
+
+# Мусор
+.DS_Store
+
+# Данные рантайма (снапшоты, видео)
+data/
+
+# Сборочные файлы
+Dockerfile
+.dockerignore
+.gitignore
