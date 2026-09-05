@@ -19,7 +19,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from telethon import TelegramClient
-from tg_config import MTPROTO_CONFIG, TELEGRAM_MODES
+from config import MTPROTO_CONFIG, TELEGRAM_MODES
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 

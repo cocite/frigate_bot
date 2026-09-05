@@ -9,33 +9,20 @@ import asyncio
 from telethon.tl.types import InputMediaUploadedPhoto, InputMediaUploadedDocument, DocumentAttributeVideo, DocumentAttributeFilename
 import log_config
 import tg_client
-from tg_config import TELEGRAM_MODES, BOT_CONFIG, MTPROTO_CONFIG
+from config import (TELEGRAM_MODES, BOT_CONFIG, MTPROTO_CONFIG, FRIGATE_PUBLIC_URL,
+                    GENAI_REVIEW_SHOW, GENAI_REVIEW_WAIT, GENAI_REVIEW_POLL,
+                    EXPORT_START_SHIFT, EXPORT_END_SHIFT, EXPORT_MAX_LEN,
+                    OUTPUT_WIDTH, OUTPUT_FPS, OUTPUT_QP)
 
-# --- 1. КОНФИГУРАЦИЯ ---
+# --- 1. КОНСТАНТЫ (пользовательские настройки — в config.py) ---
 # Директории
 CLIP_DIR    = "/app/data/media"
 
-# Настройки уведомлений
-FRIGATE_PUBLIC_URL = "http://192.168.11.101:5000"  # ссылка на review внизу сообщения; "" — не выводить
-SEND_VIDEO_SEPARATELY = False
+# Отправка в Telegram
+SEND_VIDEO_SEPARATELY = False     # отладочное: слать видео отдельной группой от фото
 MAX_MEDIA_PER_GROUP = 8
 MAX_CAPTION_LENGTH = 1024
 MAX_MESSAGE_LENGTH = 4096
-
-# Сводка review.genai из Frigate
-GENAI_REVIEW_SHOW = True        # добавлять сводку в подпись
-GENAI_REVIEW_WAIT = 25          # сколько ждать генерацию с начала обработки, сек
-GENAI_REVIEW_POLL = 2.0         # интервал опроса
-
-# Настройки видео
-EXPORT_START_SHIFT = 5
-EXPORT_END_SHIFT = 5
-EXPORT_MAX_LEN = 180
-
-# Кодирование
-OUTPUT_WIDTH = 1024
-OUTPUT_FPS = 25
-OUTPUT_QP = 26
 
 # Frigate API
 FRIGATE_URL = "http://frigate:5000"

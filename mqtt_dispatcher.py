@@ -6,7 +6,7 @@ import tg_client
 from tg_alert import send_frigate_alert
 
 # Хендлеры настраивает log_config.setup() в блоке __main__
-logger = logging.getLogger("mqtt_dispatcher")
+logger = logging.getLogger("mqtt")
 logger.setLevel(logging.DEBUG)
 
 # Настройка задач:

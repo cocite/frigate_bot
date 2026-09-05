@@ -1,5 +1,5 @@
-# Telegram credentials
-tg_config.py
+# Credentials and local settings
+config.py
 
 # Telethon sessions
 *.session
@@ -18,6 +18,3 @@ __pycache__/
 
 # Runtime data (snapshots, videos)
 data/
-
-# Local debug tooling
-replay.sh
