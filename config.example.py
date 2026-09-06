@@ -3,28 +3,23 @@
 Скопируйте в config.py и заполните: cp config.example.py config.py
 """
 
-# --- TELEGRAM MODES ---
-# Which protocols to use: 'BOT' (Bot API) and/or 'MTPROTO' (Telethon)
+# --- КАНАЛЫ ДОСТАВКИ ---
+# Доступные: TG_BOT (Telegram Bot API), TG_MTPROTO (Telegram юзер-аккаунт, видео до 2 ГБ)
 # Just uncomment the one you need
-TELEGRAM_MODES = ['BOT']
-# TELEGRAM_MODES = ['MTPROTO']
-# TELEGRAM_MODES = ['BOT', 'MTPROTO']
+ENABLED_CHANNELS = ['TG_BOT']
+# ENABLED_CHANNELS = ['TG_MTPROTO']
+# ENABLED_CHANNELS = ['TG_BOT', 'TG_MTPROTO']
 
-# --- BOT API CONFIGURATION ---
-# Just uncomment the one you need
-BOT_CONFIG = {
+# --- TG_BOT: Telegram Bot API ---
+# Токен у @BotFather; chat_id группы отрицательный
+TG_BOT_CONFIG = {
     "token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
-    "chat_id": -1234567890  # First chat
+    "chat_id": -1234567890
 }
 
-# BOT_CONFIG = {
-#     "token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
-#     "chat_id": -9876543210  # Second chat
-# }
-
-# --- MTPROTO CONFIGURATION (Telethon) ---
-# Get api_id and api_hash from https://my.telegram.org/apps
-MTPROTO_CONFIG = {
+# --- TG_MTPROTO: Telegram юзер-аккаунт (Telethon) ---
+# api_id и api_hash с https://my.telegram.org/apps
+TG_MTPROTO_CONFIG = {
     "api_id": 123456,
     "api_hash": 'abcdef1234567890abcdef1234567890',
     "session_name": 'frigate_session',

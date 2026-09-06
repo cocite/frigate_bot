@@ -37,11 +37,11 @@ cp frigate_bot/config.example.py frigate_bot/config.py
 ```
 
 Заполнить:
-- `TELEGRAM_MODES` — каналы отправки. Режимов всего два, можно включить оба сразу:
-  - `BOT` — обычный Telegram-бот, хватает в большинстве случаев (лимит видео ~50 МБ);
-  - `MTPROTO` — отправка от юзер-аккаунта. Имеет смысл только если нужно слать большие видео (лимит 2 ГБ); требует api_id/api_hash и создания сессии (шаг 5);
-- `BOT_CONFIG` — токен у [@BotFather](https://t.me/botfather), `chat_id` группы отрицательный;
-- `MTPROTO_CONFIG` — `api_id`/`api_hash` с [my.telegram.org](https://my.telegram.org/apps), нужен только для режима MTPROTO.
+- `ENABLED_CHANNELS` — включённые каналы доставки. Доступны два, можно оба сразу (каждый шлёт в свой чат):
+  - `TG_BOT` — обычный Telegram-бот, хватает в большинстве случаев (лимит видео ~50 МБ);
+  - `TG_MTPROTO` — отправка от юзер-аккаунта. Имеет смысл, только если нужно слать большие видео (лимит 2 ГБ); требует api_id/api_hash и создания сессии (шаг 5);
+- `TG_BOT_CONFIG` — токен у [@BotFather](https://t.me/botfather), `chat_id` группы отрицательный;
+- `TG_MTPROTO_CONFIG` — `api_id`/`api_hash` с [my.telegram.org](https://my.telegram.org/apps), нужен только для канала TG_MTPROTO.
 
 **3. Сервис в compose** — добавить в ваш `docker-compose.yaml` (рядом с сервисами `frigate` и `mosquitto`) блок из `docker-compose.example.yaml`:
 
@@ -87,7 +87,7 @@ docker compose logs -f frigate_bot
 
 В логе должно появиться `Subscribed to topics: ['frigate/reviews']` и `MQTT диспетчер запущен`.
 
-**5. Сессия MTProto** (только для режима MTPROTO):
+**5. Сессия MTProto** (только для канала TG_MTPROTO):
 
 ```bash
 docker compose exec -it frigate_bot python tg_client.py

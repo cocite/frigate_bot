@@ -19,7 +19,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from telethon import TelegramClient
-from config import MTPROTO_CONFIG, TELEGRAM_MODES
+from config import TG_MTPROTO_CONFIG, ENABLED_CHANNELS
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -34,14 +34,14 @@ class NotAuthorized(RuntimeError):
 
 
 def _session_name(debug: bool) -> str:
-    return MTPROTO_CONFIG['session_name'] + ('_debug' if debug else '')
+    return TG_MTPROTO_CONFIG['session_name'] + ('_debug' if debug else '')
 
 
 def _build(name: str) -> TelegramClient:
     return TelegramClient(
         os.path.join(BASE_DIR, name),
-        MTPROTO_CONFIG['api_id'],
-        MTPROTO_CONFIG['api_hash'],
+        TG_MTPROTO_CONFIG['api_id'],
+        TG_MTPROTO_CONFIG['api_hash'],
         connection_retries=10,
         retry_delay=5,
     )
@@ -83,7 +83,7 @@ async def ensure() -> TelegramClient:
 async def session(debug: bool = False):
     """Открывает MTProto-сессию на время блока. Если MTPROTO выключен — no-op."""
     global _client, _session
-    if 'MTPROTO' not in TELEGRAM_MODES:
+    if 'TG_MTPROTO' not in ENABLED_CHANNELS:
         yield
         return
 

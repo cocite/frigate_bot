@@ -9,7 +9,7 @@ import asyncio
 from telethon.tl.types import InputMediaUploadedPhoto, InputMediaUploadedDocument, DocumentAttributeVideo, DocumentAttributeFilename
 import log_config
 import tg_client
-from config import (TELEGRAM_MODES, BOT_CONFIG, MTPROTO_CONFIG, FRIGATE_PUBLIC_URL,
+from config import (ENABLED_CHANNELS, TG_BOT_CONFIG, TG_MTPROTO_CONFIG, FRIGATE_PUBLIC_URL,
                     GENAI_REVIEW_SHOW, GENAI_REVIEW_WAIT, GENAI_REVIEW_POLL,
                     EXPORT_START_SHIFT, EXPORT_END_SHIFT, EXPORT_MAX_LEN,
                     OUTPUT_WIDTH, OUTPUT_FPS, OUTPUT_QP)
@@ -18,12 +18,7 @@ from config import (TELEGRAM_MODES, BOT_CONFIG, MTPROTO_CONFIG, FRIGATE_PUBLIC_U
 # Директории
 CLIP_DIR    = "/app/data/media"
 
-# Отправка в Telegram
-SEND_VIDEO_SEPARATELY = False     # отладочное: слать видео отдельной группой от фото
-MAX_MEDIA_PER_GROUP = 8
-MAX_CAPTION_LENGTH = 1024
-MAX_MESSAGE_LENGTH = 4096
-BOT_MAX_VIDEO_MB = 49             # лимит Bot API на загрузку — 50 МБ, минус запас на служебные данные
+# Отправка в Telegram (параметры форматирования каналов — в CHANNELS, секция 6)
 BOT_API_TIMEOUT = 300             # сокет-таймаут Bot API (connect/write/read), сек
 
 # Frigate API
@@ -228,10 +223,33 @@ def _delete_export(export_id):
         logger.error("Ошибка удаления экспорта %s: %s", export_id, e)
 
 
-async def _prepare_video(export_path, review_dir, vaapi_device):
+def _find_vaapi_device():
+    """Ищет render-узел Intel (vendor 0x8086) в /dev/dri. Возвращает путь или None."""
+    try:
+        dri_path = "/dev/dri"
+        if os.path.isdir(dri_path):
+            for node in sorted(os.listdir(dri_path)):
+                if node.startswith("renderD"):
+                    vendor_path = f"/sys/class/drm/{node}/device/vendor"
+                    if os.path.exists(vendor_path):
+                        with open(vendor_path) as f:
+                            if f.read().strip() == "0x8086":
+                                return os.path.join(dri_path, node)
+    except Exception as e:
+        logger.error(f"Ошибка при поиске устройства VAAPI: {e}")
+    return None
+
+
+async def _prepare_video(export_path, review_dir):
     """Сжимает экспорт (VAAPI или CPU), делает превью и метаданные.
     Возвращает media item для отправки или None."""
     compressed_path = os.path.join(review_dir, "final.mp4")
+
+    vaapi_device = _find_vaapi_device()
+    if vaapi_device:
+        logger.info(f"Intel VAAPI: {vaapi_device}")
+    else:
+        logger.warning("Intel VAAPI не найден — видео будет кодироваться на CPU (libx264): медленнее и грузит процессор.")
 
     # Аппаратная часть: флаги входа, фильтр масштабирования, кодек с его настройкой качества.
     if vaapi_device:
@@ -312,12 +330,58 @@ async def _prepare_video(export_path, review_dir, vaapi_device):
     return {'type': 'video', 'path': compressed_path, 'thumb_path': thumb_path, 'meta': video_meta}
 
 
-# --- 5. НИЗКОУРОВНЕВЫЕ ФУНКЦИИ-ОТПРАВЩИКИ ---
+# --- 5. ФОРМАТТЕР ---
+# Превращает нейтральное уведомление в список сообщений канала.
+# Словарь сообщений — контракт пары «форматтер ↔ транспорт» одного канала.
 
-async def _mtproto_send_message(chat_id, text):
-    """(MTProto) Отправляет текстовое сообщение."""
-    client = await tg_client.ensure()
-    await asyncio.wait_for(client.send_message(chat_id, text), timeout=30)
+def _split_text(text, limit):
+    """Режет текст под лимит: по границе предложения, потом строки, потом слова."""
+    chunks = []
+    while len(text) > limit:
+        cut = max(text.rfind(". ", 0, limit), text.rfind("\n", 0, limit))
+        if cut <= 0:
+            cut = text.rfind(" ", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(text[:cut + 1].strip())
+        text = text[cut + 1:].strip()
+    if text:
+        chunks.append(text)
+    return chunks
+
+
+def messenger_style(notification, p):
+    """Общий форматтер мессенджеров: медиа альбомами, подпись к последнему альбому,
+    не влезла — отдельным сообщением. p — format_params канала."""
+    media = [{'type': 'photo', 'path': path} for path in notification['photos']]
+    separate_videos = []
+
+    video = notification.get('video')
+    if video:
+        size_mb = os.path.getsize(video['path']) / 1048576
+        if p['video_mb'] is not None and size_mb > p['video_mb']:
+            logger.warning("Видео %.1f МБ превышает лимит канала (%d МБ) — уведомление уйдёт без видео.",
+                           size_mb, p['video_mb'])
+        elif p['video_in_album']:
+            media.append(video)
+        else:
+            separate_videos.append(video)
+
+    messages = [{'kind': 'media_group', 'items': media[i:i + p['album_size']], 'caption': ''}
+                for i in range(0, len(media), p['album_size'])]
+    messages += [{'kind': 'media_group', 'items': [v], 'caption': ''} for v in separate_videos]
+
+    caption = notification.get('caption', '')
+    if caption:
+        if messages and len(caption) <= p['caption_limit']:
+            messages[-1]['caption'] = caption
+        else:
+            messages += [{'kind': 'text', 'text': chunk}
+                         for chunk in _split_text(caption, p['message_limit'])]
+    return messages
+
+
+# --- 6. ТРАНСПОРТЫ И РЕЕСТР КАНАЛОВ ---
 
 async def _mtproto_send_media_group(chat_id, media_objects, caption=""):
     """(MTProto) Отправляет группу медиа-объектов и детально логирует ответ от сервера."""
@@ -350,7 +414,7 @@ async def _mtproto_send_media_group(chat_id, media_objects, caption=""):
 def _send_bot_api_request(method, data, file_paths=None, max_retries=5):
     """(Bot API) Отправляет запрос. Возвращает успешный response или кидает RuntimeError.
     Повторяет попытки при rate limit (429), ошибках Telegram (5xx) и сетевых сбоях."""
-    url = f"https://api.telegram.org/bot{BOT_CONFIG['token']}/{method}"
+    url = f"https://api.telegram.org/bot{TG_BOT_CONFIG['token']}/{method}"
     for _ in range(max_retries):
         files = {name: open(path, 'rb') for name, path in file_paths.items()} if file_paths else None
         try:
@@ -382,94 +446,151 @@ def _send_bot_api_request(method, data, file_paths=None, max_retries=5):
                 for f in files.values(): f.close()
     raise RuntimeError(f"[BotAPI] Запрос '{method}' провалился после {max_retries} попыток.")
 
-# --- 6. УНИВЕРСАЛЬНЫЕ ФУНКЦИИ-ДИСПЕТЧЕРЫ (ОТКАЗОУСТОЙЧИВЫЕ) ---
+def _bot_media_fields(item, data_or_payload, files):
+    """(Bot API) Заполняет поля видео (размеры, длительность, превью) и регистрирует файлы."""
+    attach_name = os.path.basename(item['path'])
+    files[attach_name] = item['path']
+    if item['type'] == 'video':
+        meta = item.get('meta', {})
+        data_or_payload.update({'width': meta.get('width'), 'height': meta.get('height'),
+                                'duration': meta.get('duration'), 'supports_streaming': True})
+        if item.get('thumb_path'):
+            thumb_name = os.path.basename(item['thumb_path'])
+            files[thumb_name] = item['thumb_path']
+            data_or_payload['thumbnail'] = f"attach://{thumb_name}"
+    return attach_name
 
-async def send_telegram_message(text):
-    """Главный диспетчер: отправляет текст через все включенные режимы параллельно;
-    ошибка одного режима не мешает остальным."""
-    async def _send_via(mode):
+
+async def _deliver_bot(msg):
+    """(Bot API) Исполняет одно сообщение канала."""
+    if msg['kind'] == 'text':
+        await asyncio.to_thread(_send_bot_api_request, "sendMessage",
+                                data={"chat_id": TG_BOT_CONFIG['chat_id'], "text": msg['text']})
+        return
+
+    items = msg['items']
+    if len(items) == 1:
+        # sendMediaGroup требует 2-10 элементов — одиночное медиа шлём своим методом
+        item = items[0]
+        field = "photo" if item['type'] == 'photo' else "video"
+        data, files = {"chat_id": TG_BOT_CONFIG['chat_id']}, {}
+        attach_name = _bot_media_fields(item, data, files)
+        data[field] = f"attach://{attach_name}"
+        if msg['caption']:
+            data["caption"] = msg['caption']
+        method = "sendPhoto" if field == "photo" else "sendVideo"
+        await asyncio.to_thread(_send_bot_api_request, method, data=data, file_paths=files)
+        return
+
+    media_payload, files_to_attach = [], {}
+    for item in items:
+        payload_item = {'type': item['type']}
+        attach_name = _bot_media_fields(item, payload_item, files_to_attach)
+        payload_item['media'] = f'attach://{attach_name}'
+        media_payload.append(payload_item)
+    if msg['caption']:
+        media_payload[-1]['caption'] = msg['caption']
+    data = {"chat_id": TG_BOT_CONFIG['chat_id'], "media": json.dumps(media_payload)}
+    await asyncio.to_thread(_send_bot_api_request, "sendMediaGroup", data=data, file_paths=files_to_attach)
+
+
+async def _deliver_mtproto(msg):
+    """(MTProto) Исполняет одно сообщение канала."""
+    client = await tg_client.ensure()
+
+    if msg['kind'] == 'text':
+        await asyncio.wait_for(client.send_message(TG_MTPROTO_CONFIG['chat_id'], msg['text']), timeout=30)
+        return
+
+    # Загрузку не ограничиваем: медленная сеть — не сбой; мёртвую сеть
+    # Telethon добьёт сам (reconnect x10 → исключение)
+    items = msg['items']
+    total_mb = sum(os.path.getsize(i['path']) for i in items) / 1048576
+    logger.info(f"[MTProto] Загрузка {len(items)} файлов ({total_mb:.1f} МБ)...")
+    media_objects = []
+    for item in items:
+        if item['type'] == 'photo':
+            handle = await client.upload_file(item['path'])
+            media_objects.append(InputMediaUploadedPhoto(file=handle))
+        elif item['type'] == 'video':
+            thumb_handle = await client.upload_file(item['thumb_path']) if item.get('thumb_path') else None
+            video_handle = await client.upload_file(item['path'])
+            meta = item.get('meta', {})
+            attributes = [
+                DocumentAttributeVideo(duration=meta.get('duration'), w=meta.get('width'), h=meta.get('height'), supports_streaming=True),
+                DocumentAttributeFilename(file_name=os.path.basename(item['path']))]
+            media_objects.append(InputMediaUploadedDocument(file=video_handle, thumb=thumb_handle, attributes=attributes, mime_type='video/mp4'))
+    await _mtproto_send_media_group(TG_MTPROTO_CONFIG['chat_id'], media_objects, msg['caption'])
+
+
+CHANNELS = {
+    'TG_BOT': {
+        'formatter': messenger_style,
+        'transport': _deliver_bot,
+        'format_params': dict(album_size=8, caption_limit=1024, message_limit=4096,
+                              video_mb=49,    # лимит Bot API на загрузку (~50 МБ)
+                              video_in_album=True),
+    },
+    'TG_MTPROTO': {
+        'formatter': messenger_style,
+        'transport': _deliver_mtproto,
+        'format_params': dict(album_size=8, caption_limit=1024, message_limit=4096,
+                              video_mb=None,  # 2 ГБ, фактически без лимита
+                              video_in_album=True),
+    },
+}
+
+
+async def dispatch_notification(notification):
+    """Форматирует уведомление под каждый включённый канал и доставляет.
+    Пока: последовательно внутри канала, параллельно между каналами.
+    Этап B (см. TODO.md): вместо доставки — постановка в очереди каналов."""
+    for mode in ENABLED_CHANNELS:
+        if mode not in CHANNELS:
+            logger.error(f"Неизвестный канал '{mode}' в ENABLED_CHANNELS — пропущен.")
+
+    async def _run(mode):
+        ch = CHANNELS[mode]
         try:
-            logger.info(f"-> [Диспетчер] Попытка отправки текста через {mode}...")
-            if mode == 'BOT':
-                await asyncio.to_thread(_send_bot_api_request, "sendMessage", data={"chat_id": BOT_CONFIG['chat_id'], "text": text})
-            elif mode == 'MTPROTO':
-                await _mtproto_send_message(MTPROTO_CONFIG['chat_id'], text)
-            logger.info(f"<- [Диспетчер] Текст через {mode} успешно отправлен.")
+            messages = ch['formatter'](notification, ch['format_params'])
+            logger.info(f"-> [{mode}] доставка уведомления: {len(messages)} сообщений...")
+            for msg in messages:
+                await ch['transport'](msg)
+            logger.info(f"<- [{mode}] уведомление доставлено.")
         except tg_client.NotAuthorized as e:
-            logger.error(f"<!> [Диспетчер] {mode} недоступен: {e}")
+            logger.error(f"<!> [{mode}] недоступен: {e}")
         except Exception:
-            logger.exception(f"<!> [Диспетчер] НЕУДАЧА при отправке текста через {mode}.")
+            logger.exception(f"<!> [{mode}] НЕУДАЧА доставки уведомления.")
 
-    await asyncio.gather(*(_send_via(mode) for mode in TELEGRAM_MODES))
-
-async def send_telegram_media_group(media_items: list, caption=""):
-    """Главный диспетчер: отправляет медиагруппу через все включенные режимы параллельно;
-    ошибка одного режима не мешает остальным."""
-    async def _send_via(mode):
-        try:
-            logger.info(f"-> [Диспетчер] Попытка отправки медиагруппы ({len(media_items)} шт.) через {mode}...")
-            if mode == 'BOT':
-                # Bot API не примет видео тяжелее лимита — шлём группу без него (в MTPROTO лимит 2 ГБ)
-                items = []
-                for item in media_items:
-                    if item['type'] == 'video' and os.path.getsize(item['path']) > BOT_MAX_VIDEO_MB * 1024 * 1024:
-                        logger.error("[BotAPI] Видео %.1f МБ превышает лимит Bot API (%d МБ) — группа уйдёт без видео.",
-                                     os.path.getsize(item['path']) / 1048576, BOT_MAX_VIDEO_MB)
-                        continue
-                    items.append(item)
-                if not items:
-                    if caption:
-                        await asyncio.to_thread(_send_bot_api_request, "sendMessage",
-                                                data={"chat_id": BOT_CONFIG['chat_id'], "text": caption})
-                    logger.info("<- [Диспетчер] BOT: медиа после фильтра не осталось, отправлен только текст.")
-                    return
-                media_payload, files_to_attach = [], {}
-                for item in items:
-                    path, attach_name = item['path'], os.path.basename(item['path'])
-                    files_to_attach[attach_name] = path
-                    payload_item = {'type': item['type'], 'media': f'attach://{attach_name}'}
-                    if item['type'] == 'video':
-                        meta = item.get('meta', {})
-                        payload_item.update({'width': meta.get('width'), 'height': meta.get('height'), 'duration': meta.get('duration'), 'supports_streaming': True})
-                        if item.get('thumb_path'):
-                            thumb_path, thumb_attach_name = item['thumb_path'], os.path.basename(item['thumb_path'])
-                            files_to_attach[thumb_attach_name] = thumb_path
-                            payload_item['thumbnail'] = f"attach://{thumb_attach_name}"
-                    media_payload.append(payload_item)
-                if caption and media_payload: media_payload[-1]['caption'] = caption
-                data = {"chat_id": BOT_CONFIG['chat_id'], "media": json.dumps(media_payload)}
-                await asyncio.to_thread(_send_bot_api_request, "sendMediaGroup", data=data, file_paths=files_to_attach)
-
-            elif mode == 'MTPROTO':
-                # Загрузку не ограничиваем: медленная сеть — не сбой; мёртвую сеть
-                # Telethon добьёт сам (reconnect x10 → исключение)
-                total_mb = sum(os.path.getsize(i['path']) for i in media_items) / 1048576
-                logger.info(f"[MTProto] Загрузка {len(media_items)} файлов ({total_mb:.1f} МБ)...")
-                client = await tg_client.ensure()
-                media_objects = []
-                for item in media_items:
-                    if item['type'] == 'photo':
-                        handle = await client.upload_file(item['path'])
-                        media_objects.append(InputMediaUploadedPhoto(file=handle))
-                    elif item['type'] == 'video':
-                        thumb_handle = await client.upload_file(item['thumb_path']) if item.get('thumb_path') else None
-                        video_handle = await client.upload_file(item['path'])
-                        meta = item.get('meta', {})
-                        attributes = [
-                            DocumentAttributeVideo(duration=meta.get('duration'), w=meta.get('width'), h=meta.get('height'), supports_streaming=True),
-                            DocumentAttributeFilename(file_name=os.path.basename(item['path']))]
-                        media_objects.append(InputMediaUploadedDocument(file=video_handle, thumb=thumb_handle, attributes=attributes, mime_type='video/mp4'))
-                await _mtproto_send_media_group(MTPROTO_CONFIG['chat_id'], media_objects, caption)
-
-            logger.info(f"<- [Диспетчер] Медиагруппа через {mode} успешно отправлена.")
-        except tg_client.NotAuthorized as e:
-            logger.error(f"<!> [Диспетчер] {mode} недоступен: {e}")
-        except Exception:
-            logger.exception(f"<!> [Диспетчер] НЕУДАЧА при отправке медиагруппы через {mode}.")
-
-    await asyncio.gather(*(_send_via(mode) for mode in TELEGRAM_MODES))
+    await asyncio.gather(*(_run(mode) for mode in ENABLED_CHANNELS if mode in CHANNELS))
 
 # --- 7. ГЛАВНАЯ ФУНКЦИЯ ---
+
+def _build_caption(raw_events, start_time, end_time, camera, review_id, review_metadata):
+    """Собирает текст уведомления: время, метки с именами/номерами, зоны,
+    сводка review.genai, ссылка на review. Чистая функция без I/O."""
+    pretty_labels, zones = set(), set()
+    for raw in raw_events:
+        zones.update(raw.get("zones", []))
+        label_info = LABEL_DICT.get(raw.get("label", "UFO"), {"emoji": "❓", "name": "НЕЧТО"})
+        extra = set(filter(None, [raw.get('sub_label'), raw.get('data', {}).get('recognized_license_plate')]))
+        extra_display = f" [{' | '.join(sorted(extra))}]" if extra else ""
+        pretty_labels.add(f"{label_info['emoji']} {label_info['name']}{extra_display}")
+
+    zone_display = f" в зонах {', '.join(sorted(zones))}" if zones else ""
+    caption = (
+        f"🕒 {format_time(start_time)} – {format_time(end_time)}\n"
+        f"{', '.join(sorted(pretty_labels))} at {camera}{zone_display}"
+    )
+
+    if review_metadata and review_metadata.get("shortSummary"):
+        threat_mark = {1: "⚠️ ", 2: "🚨 "}.get(review_metadata.get("potential_threat_level") or 0, "")
+        caption += f"\n{threat_mark}📝 {review_metadata['shortSummary']}"
+
+    if FRIGATE_PUBLIC_URL:
+        caption += f"\n\n🔗 {FRIGATE_PUBLIC_URL.rstrip('/')}/review?id={review_id}"
+    return caption
+
 
 async def send_frigate_alert(payload_json: str):
     payload = json.loads(payload_json)
@@ -482,25 +603,6 @@ async def send_frigate_alert(payload_json: str):
 
     await asyncio.to_thread(subprocess.run, ["find", CLIP_DIR, "-type", "f", "-mmin", "+1440", "-delete"])
     await asyncio.to_thread(subprocess.run, ["find", CLIP_DIR, "-type", "d", "-empty", "-delete"])
-
-    VAAPI_DEVICE = None
-    try:
-        dri_path = "/dev/dri"
-        if os.path.isdir(dri_path):
-            for node in sorted(os.listdir(dri_path)):
-                if node.startswith("renderD"):
-                    vendor_path = f"/sys/class/drm/{node}/device/vendor"
-                    if os.path.exists(vendor_path):
-                        with open(vendor_path, 'r') as f:
-                            if f.read().strip() == "0x8086": # Нашли Intel!
-                                VAAPI_DEVICE = os.path.join(dri_path, node)
-                                logger.info(f"Найдено устройство Intel VAAPI: {VAAPI_DEVICE}")
-                                break
-    except Exception as e:
-        logger.error(f"Ошибка при поиске устройства VAAPI: {e}")
-
-    if not VAAPI_DEVICE:
-        logger.warning("Intel VAAPI не найден — видео будет кодироваться на CPU (libx264): медленнее и грузит процессор.")
 
     detections = payload["after"]["data"]["detections"]
     detection_times = sorted(detections, key=get_time_from_id)
@@ -537,7 +639,7 @@ async def send_frigate_alert(payload_json: str):
 
         export_path = await _wait_export(export_id) if export_id else None
         if export_path:
-            video_item = await _prepare_video(export_path, review_dir, VAAPI_DEVICE)
+            video_item = await _prepare_video(export_path, review_dir)
             if video_item:
                 media_items.append(video_item)
     finally:
@@ -545,70 +647,19 @@ async def send_frigate_alert(payload_json: str):
         if export_id:
             await asyncio.to_thread(_delete_export, export_id)
 
-    detections_data, all_zones = [], set()
-    raw_list = await asyncio.gather(*(asyncio.to_thread(_fetch_detection, d) for d in detection_times))
-    for raw_data in raw_list:
-        if not raw_data:
-            continue
-        all_zones.update(raw_data.get("zones", []))
-        label_info = LABEL_DICT.get(raw_data.get("label", "UFO"), {"emoji": "❓", "name": "НЕЧТО"})
-        additional_info = set(filter(None, [raw_data.get('sub_label'), raw_data.get('data', {}).get('recognized_license_plate')]))
-        additional_display = f" [{' | '.join(sorted(additional_info))}]" if additional_info else ""
-        detections_data.append({'raw': raw_data,
-                                'pretty_label': f"{label_info['emoji']} {label_info['name']}{additional_display}"})
-    
-    unique_pretty_labels = {d['pretty_label'] for d in detections_data}
-    labels_display = ", ".join(sorted(unique_pretty_labels))
-    zone_display = f" в зонах {', '.join(sorted(all_zones))}" if all_zones else ""
-    main_block = (
-        f"🕒 {format_time(start_time)} – {format_time(end_time)}\n"
-        f"{labels_display} at {camera}{zone_display}"
-    )
+    raw_events = [r for r in await asyncio.gather(
+        *(asyncio.to_thread(_fetch_detection, d) for d in detection_times)) if r]
 
     # Сводка review.genai: задача крутилась параллельно с самого начала
     review_metadata = await summary_task if summary_task else None
-    if review_metadata and review_metadata.get("shortSummary"):
-        threat_mark = {1: "⚠️ ", 2: "🚨 "}.get(review_metadata.get("potential_threat_level") or 0, "")
-        main_block += f"\n{threat_mark}📝 {review_metadata['shortSummary']}"
 
-    message_blocks = [main_block]
-    if FRIGATE_PUBLIC_URL:
-        message_blocks.append(f"🔗 {FRIGATE_PUBLIC_URL.rstrip('/')}/review?id={review_id}")
-
-    caption_text = "\n\n".join(message_blocks)
-    send_caption_separately = len(caption_text) > MAX_CAPTION_LENGTH
-    
-    send_queue = []
-    if SEND_VIDEO_SEPARATELY:
-        photo_items = [item for item in media_items if item['type'] == 'photo']
-        video_items = [item for item in media_items if item['type'] == 'video']
-        if photo_items:
-            for i in range(0, len(photo_items), MAX_MEDIA_PER_GROUP): send_queue.append(photo_items[i:i + MAX_MEDIA_PER_GROUP])
-        if video_items:
-            for video_item in video_items: send_queue.append([video_item])
-    else:
-        for i in range(0, len(media_items), MAX_MEDIA_PER_GROUP): send_queue.append(media_items[i:i + MAX_MEDIA_PER_GROUP])
-
-    caption_for_last_group = ""
-    if not send_caption_separately and caption_text:
-        caption_for_last_group = caption_text
-
-    if send_queue:
-        for media_group in send_queue[:-1]:
-            await send_telegram_media_group(media_group)
-        await send_telegram_media_group(send_queue[-1], caption=caption_for_last_group)
-    elif caption_text and not send_caption_separately:
-        await send_telegram_message(caption_text)
-    
-    if send_caption_separately and caption_text:
-        current_msg = ""
-        for block in message_blocks:
-            if len(current_msg) + len(block) + 2 <= MAX_MESSAGE_LENGTH:
-                current_msg += block + "\n\n"
-            else:
-                if current_msg.strip(): await send_telegram_message(current_msg.strip())
-                current_msg = block + "\n\n"
-        if current_msg.strip(): await send_telegram_message(current_msg.strip())
+    notification = {
+        'review_id': review_id,
+        'photos': [item['path'] for item in media_items if item['type'] == 'photo'],
+        'video': next((item for item in media_items if item['type'] == 'video'), None),
+        'caption': _build_caption(raw_events, start_time, end_time, camera, review_id, review_metadata),
+    }
+    await dispatch_notification(notification)
 
 # --- БЛОК ДЛЯ ЗАПУСКА ---
 if __name__ == "__main__":

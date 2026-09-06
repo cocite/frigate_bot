@@ -3,8 +3,8 @@
 ## Проблема
 
 Сейчас событие обрабатывается монолитно: воркер ждёт, пока отправят ВСЕ мессенджеры,
-и только потом берёт следующее событие. Быстрый канал (BOT) простаивает, пока медленный
-(MTPROTO с большим видео) доползает. С добавлением каналов эффект усиливается.
+и только потом берёт следующее событие. Быстрый канал (TG_BOT) простаивает, пока медленный
+(TG_MTPROTO с большим видео) доползает. С добавлением каналов эффект усиливается.
 
 ## Архитектура
 
@@ -39,14 +39,14 @@ notification = {
 
 ```python
 CHANNELS = {
-    "BOT": {
+    "TG_BOT": {
         "formatter": messenger_style,
         "transport": _deliver_bot,        # существующие отправщики Bot API
         "format_params": dict(album_size=8, caption_limit=1024, message_limit=4096,
                               video_mb=49,       # лимит Bot API (~50 МБ)
                               video_in_album=True),
     },
-    "MTPROTO": {
+    "TG_MTPROTO": {
         "formatter": messenger_style,
         "transport": _deliver_mtproto,    # существующие отправщики Telethon
         "format_params": dict(album_size=8, caption_limit=1024, message_limit=4096,
