@@ -1,8 +1,9 @@
 """
 Единственный владелец Telethon-клиента.
 
-Правило: сессию открывает entry point ('async with tg_client.session()'),
-библиотечный код берёт клиент через 'await tg_client.ensure()'.
+Правило: сессию открывает воркер канала TG_MTPROTO — session() указан как
+lifecycle канала в CHANNELS и живёт, пока жив воркер. Транспорт берёт клиент
+через 'await tg_client.ensure()'.
 
 Неавторизованная сессия сервис не роняет: он работает без MTProto,
 а ensure() пробует подключиться заново при каждой отправке — создал
@@ -71,8 +72,8 @@ async def ensure() -> TelegramClient:
         return _client
     if _session is None:
         raise RuntimeError(
-            "MTProto вне сессии: entry point должен обернуть работу "
-            "в 'async with tg_client.session()'."
+            "MTProto вне сессии: ensure() вызван не из воркера канала "
+            "TG_MTPROTO (lifecycle не открыт)."
         )
     _client = await _connect(_session)
     logger.info("Telethon-сессия '%s' подключена.", _session)

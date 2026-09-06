@@ -2,11 +2,13 @@ import asyncio
 import logging
 from aiomqtt import Client, MqttError
 import log_config
-from notifier import send_frigate_alert, start_delivery_workers, cleanup_worker
+from notifier import handle_review, start_delivery_workers, cleanup_worker
 
 # Хендлеры настраивает log_config.setup() в блоке __main__
 logger = logging.getLogger("mqtt_dispatcher")
 logger.setLevel(logging.DEBUG)
+
+MQTT_QUEUE_SIZE = 100    # сообщений в очереди на топик; при заполнении приём ждёт (backpressure)
 
 # Настройка задач:
 # Каждая задача имеет: топик, обработчик и количество воркеров.
@@ -20,7 +22,7 @@ tasks_config = [
     {
         "name": "frigate_alert_sequential",
         "topic": "frigate/reviews",
-        "handler": send_frigate_alert,
+        "handler": handle_review,
         "workers": 1
     }
 ]
@@ -36,8 +38,8 @@ async def worker(queue: asyncio.Queue, task_name: str, handler, worker_id: int):
         try:
             await handler(payload)
             logger.info(f"[{task_name}] Worker-{worker_id} successfully handled '{topic}'.")
-        except Exception as e:
-            logger.exception(f"[{task_name}] Error handling '{topic}': {e}")
+        except Exception:
+            logger.exception(f"[{task_name}] Error handling '{topic}'")
         finally:
             queue.task_done()
 
@@ -75,7 +77,7 @@ async def run_dispatcher():
     queues_by_topic = {}
     workers_tasks = []
     for task_conf in tasks_config:
-        queue = asyncio.Queue(maxsize=100)
+        queue = asyncio.Queue(maxsize=MQTT_QUEUE_SIZE)
         topic, handler = task_conf["topic"], task_conf["handler"]
         task_name, num_workers = task_conf["name"], task_conf["workers"]
         queues_by_topic.setdefault(topic, []).append(queue)
