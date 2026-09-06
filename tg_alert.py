@@ -23,6 +23,8 @@ SEND_VIDEO_SEPARATELY = False     # отладочное: слать видео 
 MAX_MEDIA_PER_GROUP = 8
 MAX_CAPTION_LENGTH = 1024
 MAX_MESSAGE_LENGTH = 4096
+BOT_MAX_VIDEO_MB = 49             # лимит Bot API на загрузку — 50 МБ, минус запас на служебные данные
+BOT_API_TIMEOUT = 300             # сокет-таймаут Bot API (connect/write/read), сек
 
 # Frigate API
 FRIGATE_URL = "http://frigate:5000"
@@ -352,7 +354,12 @@ def _send_bot_api_request(method, data, file_paths=None, max_retries=5):
     for _ in range(max_retries):
         files = {name: open(path, 'rb') for name, path in file_paths.items()} if file_paths else None
         try:
-            response = requests.post(url, data=data, files=files, timeout=60)
+            # Один щедрый таймаут на всё (connect/write/read): при параллельной отправке
+            # в несколько каналов аплинк насыщается, и write легально блокируется надолго —
+            # раздельный короткий connect-таймаут душил именно отправку тела запроса.
+            # Щедрость важна и против дублей: ретрай после таймаута может повторить
+            # уже принятую Telegram'ом группу.
+            response = requests.post(url, data=data, files=files, timeout=BOT_API_TIMEOUT)
             if response.status_code == 429:
                 retry_after = response.json().get("parameters", {}).get("retry_after", 5)
                 logger.warning(f"[BotAPI] Rate limit. Повтор через {retry_after} сек.")
@@ -364,7 +371,8 @@ def _send_bot_api_request(method, data, file_paths=None, max_retries=5):
                 continue
             if response.status_code != 200:
                 # 4xx — постоянная ошибка, повторять бессмысленно
-                raise RuntimeError(f"[BotAPI] {method}: HTTP {response.status_code}, {response.text[:300]}")
+                raise RuntimeError(f"[BotAPI] {method}: HTTP {response.status_code}, {response.text[:300]}"
+                                   f" (files: {list(file_paths) if file_paths else '-'})")
             return response
         except requests.RequestException as e:
             logger.error(f"[BotAPI] Сетевая ошибка: {e}")
@@ -401,8 +409,22 @@ async def send_telegram_media_group(media_items: list, caption=""):
         try:
             logger.info(f"-> [Диспетчер] Попытка отправки медиагруппы ({len(media_items)} шт.) через {mode}...")
             if mode == 'BOT':
-                media_payload, files_to_attach = [], {}
+                # Bot API не примет видео тяжелее лимита — шлём группу без него (в MTPROTO лимит 2 ГБ)
+                items = []
                 for item in media_items:
+                    if item['type'] == 'video' and os.path.getsize(item['path']) > BOT_MAX_VIDEO_MB * 1024 * 1024:
+                        logger.error("[BotAPI] Видео %.1f МБ превышает лимит Bot API (%d МБ) — группа уйдёт без видео.",
+                                     os.path.getsize(item['path']) / 1048576, BOT_MAX_VIDEO_MB)
+                        continue
+                    items.append(item)
+                if not items:
+                    if caption:
+                        await asyncio.to_thread(_send_bot_api_request, "sendMessage",
+                                                data={"chat_id": BOT_CONFIG['chat_id'], "text": caption})
+                    logger.info("<- [Диспетчер] BOT: медиа после фильтра не осталось, отправлен только текст.")
+                    return
+                media_payload, files_to_attach = [], {}
+                for item in items:
                     path, attach_name = item['path'], os.path.basename(item['path'])
                     files_to_attach[attach_name] = path
                     payload_item = {'type': item['type'], 'media': f'attach://{attach_name}'}
@@ -419,6 +441,10 @@ async def send_telegram_media_group(media_items: list, caption=""):
                 await asyncio.to_thread(_send_bot_api_request, "sendMediaGroup", data=data, file_paths=files_to_attach)
 
             elif mode == 'MTPROTO':
+                # Загрузку не ограничиваем: медленная сеть — не сбой; мёртвую сеть
+                # Telethon добьёт сам (reconnect x10 → исключение)
+                total_mb = sum(os.path.getsize(i['path']) for i in media_items) / 1048576
+                logger.info(f"[MTProto] Загрузка {len(media_items)} файлов ({total_mb:.1f} МБ)...")
                 client = await tg_client.ensure()
                 media_objects = []
                 for item in media_items:

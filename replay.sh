@@ -2,8 +2,8 @@
 # Реплей последнего события Frigate из лога в MQTT — для отладки.
 #
 # Запуск из любого места:
-#   ./replay_last_event.sh          # последний payload из свежего лога
-#   ./replay_last_event.sh <файл>   # payload из указанного лога
+#   ./replay.sh          # последний payload из свежего лога
+#   ./replay.sh <файл>   # payload из указанного лога
 #
 # В лог попадают только события type="end", фильтровать не нужно.
 set -euo pipefail

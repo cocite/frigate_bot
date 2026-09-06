@@ -25,10 +25,10 @@ Telegram-уведомления о событиях [Frigate](https://frigate.vi
 **1. Код** — клонировать рядом с docker-compose.yaml от Frigate NVR:
 
 ```bash
-git clone <url-репозитория>
+git clone https://github.com/cocite/frigate_bot.git
 ```
 
-Папка должна называться `frigate_bot` — на неё ссылаются пути в compose. Если репозиторий клонировался под другим именем, добавьте его вторым аргументом: `git clone <url> frigate_bot`.
+Папка должна называться `frigate_bot` — на неё ссылаются пути в compose (при клоне командой выше так и будет).
 
 **2. Конфиг:**
 
@@ -144,10 +144,10 @@ docker compose exec -T mosquitto mosquitto_pub -t frigate/reviews -m '<json payl
 
 | Параметр | По умолчанию | Что делает |
 |---|---|---|
+| `FRIGATE_PUBLIC_URL` | `""` | URL веб-интерфейса Frigate (`http://192.168.1.10:5000` или `https://frigate.example.com`) — внизу сообщения будет ссылка на review; `""` — без ссылки |
 | `GENAI_REVIEW_SHOW` | `True` | добавлять в подпись ИИ-сводку review.genai из Frigate |
 | `GENAI_REVIEW_WAIT` | `25` | сколько ждать генерацию сводки с начала обработки, сек |
 | `GENAI_REVIEW_POLL` | `2.0` | интервал опроса готовности сводки, сек |
-| `FRIGATE_PUBLIC_URL` | — | URL веб-интерфейса Frigate (`http://192.168.1.10:5000` или `https://frigate.example.com`) — внизу сообщения будет ссылка на review; `""` — без ссылки |
 | `EXPORT_START_SHIFT` / `EXPORT_END_SHIFT` | `5` / `5` | запас видео до/после события, сек |
 | `EXPORT_MAX_LEN` | `180` | максимум длины ролика, сек; подобрано опытным путём — при текущих параметрах кодирования итоговый файл укладывается в лимит Bot API (~50 МБ) |
 | `OUTPUT_WIDTH` / `OUTPUT_FPS` / `OUTPUT_QP` | `1024` / `25` / `26` | параметры кодирования |
