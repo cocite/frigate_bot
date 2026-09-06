@@ -129,7 +129,7 @@ review:
 Обработчик события можно запустить напрямую, без MQTT — payload берётся из лога (строки `Payload: {...}`):
 
 ```bash
-docker compose exec -it frigate_bot python tg_alert.py '<json payload>'
+docker compose exec -it frigate_bot python notifier.py '<json payload>'
 ```
 
 Использует отдельную Telethon-сессию `*_debug` (создаётся так же: `python tg_client.py --debug`), поэтому не конфликтует с работающим сервисом.

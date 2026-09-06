@@ -17,9 +17,11 @@ from config import (ENABLED_CHANNELS, TG_BOT_CONFIG, TG_MTPROTO_CONFIG, FRIGATE_
 # --- 1. КОНСТАНТЫ (пользовательские настройки — в config.py) ---
 # Директории
 CLIP_DIR    = "/app/data/media"
+CLEANUP_INTERVAL = 3600           # период уборки старых медиа из CLIP_DIR, сек
 
 # Отправка в Telegram (параметры форматирования каналов — в CHANNELS, секция 6)
 BOT_API_TIMEOUT = 300             # сокет-таймаут Bot API (connect/write/read), сек
+DELIVERY_QUEUE_SIZE = 30          # сообщений в очереди доставки каждого канала
 
 # Frigate API
 FRIGATE_URL = "http://frigate:5000"
@@ -63,6 +65,15 @@ os.makedirs(CLIP_DIR, exist_ok=True)
 def get_time_from_id(detection_id): return float(detection_id.split('-')[0])
 
 def format_time(ts): return time.strftime('%H:%M:%S', time.localtime(ts))
+
+async def cleanup_worker():
+    """Периодическая уборка CLIP_DIR: удаляет медиа старше суток.
+    Запускается entry point'ом сервиса; раньше жила в горячем пути каждого события."""
+    while True:
+        await asyncio.to_thread(subprocess.run, ["find", CLIP_DIR, "-type", "f", "-mmin", "+1440", "-delete"])
+        await asyncio.to_thread(subprocess.run, ["find", CLIP_DIR, "-type", "d", "-empty", "-delete"])
+        await asyncio.sleep(CLEANUP_INTERVAL)
+
 
 def _fetch_snapshot(detection_id, dest_path):
     """Скачивает размеченный снапшот события через API Frigate."""
@@ -534,6 +545,8 @@ CHANNELS = {
     'TG_MTPROTO': {
         'formatter': messenger_style,
         'transport': _deliver_mtproto,
+        'lifecycle': tg_client.session,   # канал сам владеет своей MTProto-сессией
+
         'format_params': dict(album_size=8, caption_limit=1024, message_limit=4096,
                               video_mb=None,  # 2 ГБ, фактически без лимита
                               video_in_album=True),
@@ -541,28 +554,75 @@ CHANNELS = {
 }
 
 
-async def dispatch_notification(notification):
-    """Форматирует уведомление под каждый включённый канал и доставляет.
-    Пока: последовательно внутри канала, параллельно между каналами.
-    Этап B (см. TODO.md): вместо доставки — постановка в очереди каналов."""
+# Очереди доставки: у каждого включённого канала своя, каналы разгребают их
+# в своём темпе — медленный не тормозит быстрых (см. delivery_queues_analysis.md)
+_delivery_queues = {}
+
+
+async def _delivery_loop(mode):
+    """Вечный цикл воркера: взял (review_id, msg) из очереди — отдал транспорту.
+    Ошибка сообщения логируется и не убивает воркера."""
+    q = _delivery_queues[mode]
+    transport = CHANNELS[mode]['transport']
+    logger.info(f"[{mode}] воркер доставки запущен.")
+    while True:
+        review_id, msg = await q.get()
+        try:
+            await transport(msg)
+            logger.info(f"<- [{mode}] {review_id}: {msg['kind']} доставлено (в очереди {q.qsize()}).")
+        except tg_client.NotAuthorized as e:
+            logger.error(f"<!> [{mode}] {review_id}: {e}")
+        except Exception:
+            logger.exception(f"<!> [{mode}] {review_id}: ПРОВАЛ {msg['kind']}.")
+        finally:
+            q.task_done()
+
+
+async def _delivery_worker(mode, debug=False):
+    """Воркер канала. Если у канала есть lifecycle (сессия MTProto) —
+    владеет им: открывает на время своей жизни."""
+    lifecycle = CHANNELS[mode].get('lifecycle')
+    if lifecycle:
+        async with lifecycle(debug):
+            await _delivery_loop(mode)
+    else:
+        await _delivery_loop(mode)
+
+
+def start_delivery_workers(debug=False):
+    """Создаёт очереди и воркеров доставки для включённых каналов.
+    Зовётся entry point'ом; возвращённые task'и держать — иначе соберёт GC."""
+    tasks = []
     for mode in ENABLED_CHANNELS:
         if mode not in CHANNELS:
             logger.error(f"Неизвестный канал '{mode}' в ENABLED_CHANNELS — пропущен.")
+            continue
+        _delivery_queues[mode] = asyncio.Queue(maxsize=DELIVERY_QUEUE_SIZE)
+        tasks.append(asyncio.create_task(_delivery_worker(mode, debug), name=f"delivery-{mode}"))
+    return tasks
 
-    async def _run(mode):
+
+async def flush_delivery_queues():
+    """Дождаться, пока воркеры разгребут все очереди (debug-режим)."""
+    await asyncio.gather(*(q.join() for q in _delivery_queues.values()))
+
+
+async def dispatch_notification(notification):
+    """Форматирует уведомление под включённые каналы и раскладывает готовые
+    сообщения по их очередям. Дальше каждый канал доставляет в своём темпе."""
+    rid = notification['review_id']
+    for mode, q in _delivery_queues.items():
         ch = CHANNELS[mode]
         try:
             messages = ch['formatter'](notification, ch['format_params'])
-            logger.info(f"-> [{mode}] доставка уведомления: {len(messages)} сообщений...")
-            for msg in messages:
-                await ch['transport'](msg)
-            logger.info(f"<- [{mode}] уведомление доставлено.")
-        except tg_client.NotAuthorized as e:
-            logger.error(f"<!> [{mode}] недоступен: {e}")
         except Exception:
-            logger.exception(f"<!> [{mode}] НЕУДАЧА доставки уведомления.")
-
-    await asyncio.gather(*(_run(mode) for mode in ENABLED_CHANNELS if mode in CHANNELS))
+            logger.exception(f"<!> [{mode}] {rid}: ошибка форматтера — событие пропущено.")
+            continue
+        if q.full():
+            logger.warning(f"[{mode}] очередь заполнена ({q.qsize()}) — канал не успевает, ждём место.")
+        for msg in messages:
+            await q.put((rid, msg))
+        logger.info(f"-> [{mode}] {rid}: {len(messages)} сообщений в очередь (в очереди {q.qsize()}).")
 
 # --- 7. ГЛАВНАЯ ФУНКЦИЯ ---
 
@@ -600,9 +660,6 @@ async def send_frigate_alert(payload_json: str):
         return
 
     logger.info(f"Payload: {payload_json}")
-
-    await asyncio.to_thread(subprocess.run, ["find", CLIP_DIR, "-type", "f", "-mmin", "+1440", "-delete"])
-    await asyncio.to_thread(subprocess.run, ["find", CLIP_DIR, "-type", "d", "-empty", "-delete"])
 
     detections = payload["after"]["data"]["detections"]
     detection_times = sorted(detections, key=get_time_from_id)
@@ -672,10 +729,16 @@ if __name__ == "__main__":
 
     async def debug_run():
         logger.info("Запуск в режиме отладки (сессия *_debug)...")
-        # Отключение клиента гарантирует finally внутри session(), даже при ошибке
-        async with tg_client.session(debug=True):
+        workers = start_delivery_workers(debug=True)
+        try:
             await send_frigate_alert(payload_from_cli)
-        logger.info("Функция send_frigate_alert завершена.")
+            await flush_delivery_queues()   # дождаться, пока каналы всё отправят
+        finally:
+            for t in workers:
+                t.cancel()
+            # даём воркерам корректно закрыться (session() отключает клиента в finally)
+            await asyncio.gather(*workers, return_exceptions=True)
+        logger.info("Отладочный прогон завершён.")
 
     try:
         asyncio.run(debug_run())

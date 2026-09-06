@@ -2,8 +2,7 @@ import asyncio
 import logging
 from aiomqtt import Client, MqttError
 import log_config
-import tg_client
-from tg_alert import send_frigate_alert
+from notifier import send_frigate_alert, start_delivery_workers, cleanup_worker
 
 # Хендлеры настраивает log_config.setup() в блоке __main__
 logger = logging.getLogger("mqtt_dispatcher")
@@ -90,9 +89,11 @@ async def run_dispatcher():
     await asyncio.gather(mqtt_task, *workers_tasks)
 
 async def main():
-    """Entry point: поднимает внешние клиенты и запускает диспетчер."""
-    async with tg_client.session():
-        await run_dispatcher()
+    """Entry point: воркеры доставки каналов, периодическая уборка, MQTT-диспетчер.
+    Жизненным циклом клиентов (сессия MTProto) владеют сами воркеры каналов."""
+    delivery_tasks = start_delivery_workers()          # держим ссылки, иначе соберёт GC
+    cleanup_task = asyncio.create_task(cleanup_worker(), name="cleanup")
+    await run_dispatcher()
 
 if __name__ == "__main__":
     log_config.setup("frigate_bot.log")
