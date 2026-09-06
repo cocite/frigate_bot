@@ -43,7 +43,7 @@ cp frigate_bot/config.example.py frigate_bot/config.py
 - `BOT_CONFIG` — токен у [@BotFather](https://t.me/botfather), `chat_id` группы отрицательный;
 - `MTPROTO_CONFIG` — `api_id`/`api_hash` с [my.telegram.org](https://my.telegram.org/apps), нужен только для режима MTPROTO.
 
-**3. Сервис в compose** — добавить в ваш `docker-compose.yaml` (рядом с сервисами `frigate` и `mosquitto`) блок из `docker-compose.yaml.example`:
+**3. Сервис в compose** — добавить в ваш `docker-compose.yaml` (рядом с сервисами `frigate` и `mosquitto`) блок из `docker-compose.example.yaml`:
 
 ```yaml
   frigate_bot:
