@@ -89,11 +89,15 @@ async def run_dispatcher():
     await asyncio.gather(mqtt_task, *workers_tasks)
 
 async def main():
-    """Entry point: воркеры доставки каналов, периодическая уборка, MQTT-диспетчер.
-    Жизненным циклом клиентов (сессия MTProto) владеют сами воркеры каналов."""
-    delivery_tasks = start_delivery_workers()          # держим ссылки, иначе соберёт GC
-    cleanup_task = asyncio.create_task(cleanup_worker(), name="cleanup")
-    await run_dispatcher()
+    """Entry point: MQTT-диспетчер, воркеры доставки каналов, периодическая уборка.
+    Жизненным циклом клиентов (сессия MTProto) владеют сами воркеры каналов.
+    Всё в одном gather: смерть любой задачи роняет процесс с traceback'ом
+    (compose перезапустит), а не остаётся незамеченной."""
+    await asyncio.gather(
+        run_dispatcher(),
+        cleanup_worker(),
+        *start_delivery_workers(),
+    )
 
 if __name__ == "__main__":
     log_config.setup("frigate_bot.log")

@@ -90,8 +90,10 @@ async def session(debug: bool = False):
     _session = _session_name(debug)
     try:
         await ensure()
-    except NotAuthorized as e:
-        logger.warning("MTProto пока недоступен: %s", e)
+    except Exception as e:
+        # Любой сбой при старте (нет сессии, нет сети, залочен файл) — не смертелен:
+        # ensure() переподключится при первой же отправке
+        logger.warning("MTProto пока недоступен (%s): %s", type(e).__name__, e)
         logger.warning("Продолжаю без MTProto — буду пробовать подключиться при каждой отправке.")
 
     try:

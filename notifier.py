@@ -611,6 +611,9 @@ async def dispatch_notification(notification):
     """Форматирует уведомление под включённые каналы и раскладывает готовые
     сообщения по их очередям. Дальше каждый канал доставляет в своём темпе."""
     rid = notification['review_id']
+    if not _delivery_queues:
+        logger.error(f"{rid}: воркеры доставки не запущены (start_delivery_workers) — уведомление потеряно.")
+        return
     for mode, q in _delivery_queues.items():
         ch = CHANNELS[mode]
         try:
@@ -707,8 +710,14 @@ async def send_frigate_alert(payload_json: str):
     raw_events = [r for r in await asyncio.gather(
         *(asyncio.to_thread(_fetch_detection, d) for d in detection_times)) if r]
 
-    # Сводка review.genai: задача крутилась параллельно с самого начала
-    review_metadata = await summary_task if summary_task else None
+    # Сводка review.genai: задача крутилась параллельно с самого начала.
+    # Её сбой не должен стоить алерта — сводка необязательна
+    review_metadata = None
+    if summary_task:
+        try:
+            review_metadata = await summary_task
+        except Exception:
+            logger.exception(f"{review_id}: сбой задачи сводки review.genai — уведомление уйдёт без неё.")
 
     notification = {
         'review_id': review_id,
