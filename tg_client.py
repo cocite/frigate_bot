@@ -19,7 +19,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from telethon import TelegramClient
-from config import TG_MTPROTO_CONFIG, ENABLED_CHANNELS
+from config import TG_MTPROTO_CONFIG
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -81,12 +81,8 @@ async def ensure() -> TelegramClient:
 
 @asynccontextmanager
 async def session(debug: bool = False):
-    """Открывает MTProto-сессию на время блока. Если MTPROTO выключен — no-op."""
+    """Открывает MTProto-сессию на время блока (lifecycle канала TG_MTPROTO)."""
     global _client, _session
-    if 'TG_MTPROTO' not in ENABLED_CHANNELS:
-        yield
-        return
-
     _session = _session_name(debug)
     try:
         await ensure()

@@ -60,7 +60,6 @@ logger.setLevel(logging.DEBUG)
 # попытка подключения повторяется на каждой отправке.
 
 # --- 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-os.makedirs(CLIP_DIR, exist_ok=True)
 
 def get_time_from_id(detection_id): return float(detection_id.split('-')[0])
 
@@ -69,6 +68,7 @@ def format_time(ts): return time.strftime('%H:%M:%S', time.localtime(ts))
 async def cleanup_worker():
     """Периодическая уборка CLIP_DIR: удаляет медиа старше суток.
     Запускается entry point'ом сервиса; раньше жила в горячем пути каждого события."""
+    os.makedirs(CLIP_DIR, exist_ok=True)   # каталог нужен до первого find
     while True:
         await asyncio.to_thread(subprocess.run, ["find", CLIP_DIR, "-type", "f", "-mmin", "+1440", "-delete"])
         await asyncio.to_thread(subprocess.run, ["find", CLIP_DIR, "-type", "d", "-empty", "-delete"])
@@ -184,18 +184,15 @@ def _request_export(camera, start_int, end_int):
 
 
 def _export_record(export_id):
-    """Персистентная запись об экспорте: in_progress и video_path.
-    Параметр '_' обходит кеш nginx — он подтверждённо кеширует /api/ на несколько секунд.
-    Возвращает None, если записи ещё нет (404), {} если ответ не получен."""
+    """Запись об экспорте (in_progress, video_path) или None, если её ещё нет / не получена.
+    Параметр '_' обходит кеш nginx — он подтверждённо кеширует /api/ на несколько секунд."""
     try:
         r = requests.get(f"{FRIGATE_URL}/api/exports/{export_id}",
                          params={"_": int(time.time() * 1000)},
                          timeout=FRIGATE_TIMEOUT)
-        if r.status_code == 404:
-            return None
-        return (r.json() or {}) if r.status_code == 200 else {}
+        return r.json() if r.status_code == 200 else None
     except (requests.RequestException, ValueError):
-        return {}
+        return None
 
 
 async def _wait_export(export_id):
@@ -394,17 +391,12 @@ def messenger_style(notification, p):
 
 # --- 6. ТРАНСПОРТЫ И РЕЕСТР КАНАЛОВ ---
 
-async def _mtproto_send_media_group(chat_id, media_objects, caption=""):
-    """(MTProto) Отправляет группу медиа-объектов и детально логирует ответ от сервера."""
-    if not media_objects:
-        logger.warning("[MTProto] Попытка отправить пустую медиагруппу.")
-        return
-    
+async def _mtproto_send_media_group(client, chat_id, media_objects, caption=""):
+    """(MTProto) Отправляет альбом из уже загруженных медиа и логирует ответ сервера."""
     logger.info(f"[MTProto] Отправка медиагруппы из {len(media_objects)} объектов...")
-    client = await tg_client.ensure()
     sent_messages = await asyncio.wait_for(
         client.send_file(chat_id, file=media_objects, caption=caption),
-        timeout=180   # видео грузится дольше — потолок щедрее
+        timeout=180   # файлы уже загружены — это только сборка альбома
     )
 
     if not sent_messages:
@@ -531,7 +523,7 @@ async def _deliver_mtproto(msg):
                 DocumentAttributeVideo(duration=meta.get('duration'), w=meta.get('width'), h=meta.get('height'), supports_streaming=True),
                 DocumentAttributeFilename(file_name=os.path.basename(item['path']))]
             media_objects.append(InputMediaUploadedDocument(file=video_handle, thumb=thumb_handle, attributes=attributes, mime_type='video/mp4'))
-    await _mtproto_send_media_group(TG_MTPROTO_CONFIG['chat_id'], media_objects, msg['caption'])
+    await _mtproto_send_media_group(client, TG_MTPROTO_CONFIG['chat_id'], media_objects, msg['caption'])
 
 
 CHANNELS = {
@@ -690,18 +682,16 @@ async def send_frigate_alert(payload_json: str):
     # Экспорт запрашиваем сразу: Frigate собирает ролик, пока мы качаем снапшоты
     export_id = await asyncio.to_thread(_request_export, camera, start_int, end_int)
 
-    media_items = []
+    photos, video = [], None
     try:
         snapshots = [(d, os.path.join(review_dir, f"{d}.jpg")) for d in detection_times]
         fetched = await asyncio.gather(*(asyncio.to_thread(_fetch_snapshot, d, p) for d, p in snapshots))
-        media_items += [{'type': 'photo', 'path': p} for (d, p), ok in zip(snapshots, fetched) if ok]
-        logger.info("Снапшоты: скачано %d из %d", len(media_items), len(detection_times))
+        photos = [p for (d, p), ok in zip(snapshots, fetched) if ok]
+        logger.info("Снапшоты: скачано %d из %d", len(photos), len(detection_times))
 
         export_path = await _wait_export(export_id) if export_id else None
         if export_path:
-            video_item = await _prepare_video(export_path, review_dir)
-            if video_item:
-                media_items.append(video_item)
+            video = await _prepare_video(export_path, review_dir)   # dict или None
     finally:
         # Экспорт удаляется всегда, даже если обработка упала
         if export_id:
@@ -721,8 +711,8 @@ async def send_frigate_alert(payload_json: str):
 
     notification = {
         'review_id': review_id,
-        'photos': [item['path'] for item in media_items if item['type'] == 'photo'],
-        'video': next((item for item in media_items if item['type'] == 'video'), None),
+        'photos': photos,
+        'video': video,
         'caption': _build_caption(raw_events, start_time, end_time, camera, review_id, review_metadata),
     }
     await dispatch_notification(notification)

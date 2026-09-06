@@ -21,19 +21,20 @@
 
 ## B. Упрощения
 
-- [ ] **B1. `media_items` с тегами `type`** в `send_frigate_alert` — рудимент старой
+- [x] **B1. `media_items` с тегами `type`** в `send_frigate_alert` — рудимент старой
   отправки: собираем с тегами, потом фильтруем обратно. Собирать сразу `photos` и `video`.
-- [ ] **B2. `_deliver_bot`, одиночное медиа:** `item['type']` совпадает с именем поля
-  Bot API (`photo`/`video`) — ветки `field`/`method` схлопываются:
-  `method = "sendPhoto" if item['type'] == "photo" else "sendVideo"; data[item['type']] = ...`.
-- [ ] **B3. `_mtproto_send_media_group`:** второй `ensure()` (client уже есть у вызывающего —
+- [x] **B2. `_deliver_bot`, одиночное медиа** — ОТКЛОНЕНО: `field` — явная точка перевода
+  нашего `type` в имя поля Bot API (сегодня совпадают, но это совпадение, а не закон —
+  прецедент thumb→thumbnail). Схлопывание протащило бы терминологию Telegram в
+  нейтральный формат. Оставлено как есть.
+- [x] **B3. `_mtproto_send_media_group`:** второй `ensure()` (client уже есть у вызывающего —
   передать параметром); guard на пустой список мёртв (форматтер не выдаёт пустых групп).
-- [ ] **B4. `_export_record`:** различие `None` (404) / `{}` (ошибка) нигде не используется —
+- [x] **B4. `_export_record`:** различие `None` (404) / `{}` (ошибка) нигде не используется —
   вернуть `None` в обоих случаях, docstring укоротить.
-- [ ] **B5. `os.makedirs(CLIP_DIR)` при импорте** — побочный эффект и избыточно
+- [x] **B5. `os.makedirs(CLIP_DIR)` при импорте** — побочный эффект и избыточно
   (`makedirs(review_dir)` создаёт родителей). Перенести в начало `cleanup_worker`
   (единственный, кому каталог нужен до первого события).
-- [ ] **B6. `tg_client.session()`:** ветка `if 'TG_MTPROTO' not in ENABLED_CHANNELS` мертва
+- [x] **B6. `tg_client.session()`:** ветка `if 'TG_MTPROTO' not in ENABLED_CHANNELS` мертва
   (сессию открывает только воркер этого канала) — убрать вместе с импортом `ENABLED_CHANNELS`.
 
 ## C. Имена и комментарии
