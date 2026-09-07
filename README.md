@@ -1,49 +1,55 @@
 # frigate_bot
 
-> ⚠️ **Это README сгенерировано ИИ** — возможны излишние детали, а чего-то может не хватать. Нормальное README в процессе создания.
+> Written with AI assistance — some parts may be overly detailed, others missing. A proper README is in progress.
 
-Telegram-уведомления о событиях [Frigate](https://frigate.video): снапшоты с разметкой + сжатое видео + подпись с метками, зонами и ИИ-сводкой происходящего.
+Telegram notifications for [Frigate NVR](https://frigate.video). For every finished event (Frigate *review item*) you get one message with:
 
-Протестировано на **Frigate 0.18**.
+- **Annotated snapshots** of every detected object.
+- **A video clip of the whole event** — all objects, compressed to fit Telegram limits (hardware encoding on Intel iGPU, CPU otherwise).
+- **A caption**: time span, camera, zones, object labels — including sub-labels, recognized faces and license plates when Face Recognition / LPR are enabled in Frigate.
+- **AI summary** from Frigate's `review.genai` (`📝 A person walks up to the porch, checks the door and leaves`) with a ⚠️/🚨 marker when Frigate rates the activity as a potential concern.
+- **A link** to the review in your Frigate UI.
 
-## Как это работает
+Delivery channels — enable one or both:
 
-- слушает MQTT-топик `frigate/reviews`;
-- когда событие завершается (`type: end`) — скачивает размеченные снапшоты детекций, заказывает у Frigate экспорт видео, сжимает его через VAAPI (или CPU, если GPU нет);
-- параллельно ждёт ИИ-сводку события от Frigate (`review.genai`) и добавляет её в подпись — с маркером ⚠️/🚨 при ненулевом уровне угрозы;
-- отправляет медиагруппу в Telegram через Bot API и/или MTProto — параллельно, отказ одного канала не мешает другому.
+- **Telegram Bot API** — videos up to 50 MB (larger clips are sent without video).
+- **Telegram MTProto** (user account) — videos up to 2 GB.
 
-## Требования
+Each channel has its own queue and worker, so a slow upload on one channel never delays the other.
 
-- Docker + Compose; сервисы `frigate` и `mosquitto` в том же compose — бот обращается к ним по этим именам (`frigate:5000`, `mosquitto:1883`);
-- во Frigate включены MQTT, снапшоты и записи;
-- опционально: Intel iGPU (Broadwell / Core 5xxx и новее) для аппаратного кодирования. Без него бот кодирует на CPU и предупреждает об этом в логе;
-- опционально: включённый `review.genai` во Frigate — для ИИ-сводок в подписи (см. ниже).
+Tested on **Frigate 0.18**.
 
-## Установка
+<p align="center">
+  <img src="docs/fella_ptz_cam_courtyard.png" width="300" align="middle" alt="Person recognized by face, with AI summary">
+  <img src="docs/ride_ptz_cam.png" width="300" align="middle" alt="Car on the PTZ camera, with AI summary">
+  <img src="docs/ride_panorama_cam.png" width="300" align="middle" alt="Car on the panorama camera, with AI summary">
+</p>
 
-**1. Код** — клонировать рядом с docker-compose.yaml от Frigate NVR:
+## Quick start
+
+**1. Clone** next to your Frigate `docker-compose.yaml`:
 
 ```bash
 git clone https://github.com/cocite/frigate_bot.git
 ```
 
-Папка должна называться `frigate_bot` — на неё ссылаются пути в compose (при клоне командой выше так и будет).
-
-**2. Конфиг:**
+**2. Configure:**
 
 ```bash
 cp frigate_bot/config.example.py frigate_bot/config.py
 ```
 
-Заполнить:
-- `ENABLED_CHANNELS` — включённые каналы доставки. Доступны два, можно оба сразу (каждый шлёт в свой чат):
-  - `TG_BOT` — обычный Telegram-бот, хватает в большинстве случаев (лимит видео ~50 МБ);
-  - `TG_MTPROTO` — отправка от юзер-аккаунта. Имеет смысл, только если нужно слать большие видео (лимит 2 ГБ); требует api_id/api_hash и создания сессии (шаг 5);
-- `TG_BOT_CONFIG` — токен у [@BotFather](https://t.me/botfather), `chat_id` группы отрицательный;
-- `TG_MTPROTO_CONFIG` — `api_id`/`api_hash` с [my.telegram.org](https://my.telegram.org/apps), нужен только для канала TG_MTPROTO.
+Fill in the credentials of the channel you use and enable it in `ENABLED_CHANNELS` — the template explains every field.
 
-**3. Сервис в compose** — добавить в ваш `docker-compose.yaml` (рядом с сервисами `frigate` и `mosquitto`) блок из `docker-compose.example.yaml`:
+**3. Add the service** to your Frigate `docker-compose.yaml`:
+
+```bash
+grep -q '^  frigate_bot:' docker-compose.yaml && echo "frigate_bot is already there" || \
+sed -n '/^  frigate_bot:/,$p' frigate_bot/docker-compose.example.yaml >> docker-compose.yaml && \
+docker compose config --services
+```
+
+This appends the block below to the end of the file (works when `services:` is the last top-level section — the usual Frigate layout; otherwise paste it into `services:` by hand) and prints the service list to confirm the file is still valid. The bot reaches `frigate` and `mosquitto` by these service names, so it has to be in the same compose file.
 
 ```yaml
   frigate_bot:
@@ -52,102 +58,130 @@ cp frigate_bot/config.example.py frigate_bot/config.py
       context: ./frigate_bot
     restart: unless-stopped
 
-    # Обе секции ниже (environment + devices) нужны только для аппаратного
-    # кодирования видео (VAAPI) на Intel iGPU (Broadwell / Core 5xxx и новее).
-    # /dev/dri — стандартный путь GPU-устройств ядра Linux, одинаков во всех дистрибутивах.
-    # Если убрать — бот сам перейдёт на CPU-кодирование (libx264).
-    environment:
-      LIBVA_DRIVER_NAME: iHD
-    devices:
-      - /dev/dri:/dev/dri
-    # Если VAAPI не заводится без привилегий — раскомментируй:
-    # privileged: true
+    # Uncomment if you have an Intel iGPU — hardware video encoding (VAAPI):
+    # environment:
+    #   LIBVA_DRIVER_NAME: iHD
+    # devices:
+    #   - /dev/dri:/dev/dri
 
     volumes:
-      # Код бота: живой с хоста, правки подхватываются рестартом без пересборки
       - ./frigate_bot:/app
-      # Медиатека Frigate — только чтение, отсюда бот забирает готовые экспорты.
-      # Путь слева должен совпадать с тем, что смонтирован в сервисе frigate.
-      - ./media/frigate:/media/frigate:ro
-      # Часовой пояс хоста — чтобы время в подписях совпадало с реальностью
-      - /etc/localtime:/etc/localtime:ro
+      - /etc/localtime:/etc/localtime:ro   # host time zone for captions
 
     depends_on:
+      - frigate
       - mosquitto
 ```
 
-Поправьте пути volumes под свою раскладку (`./media/frigate` — тот же каталог, что смонтирован в сервисе `frigate`).
-
-**4. Запуск:**
+**4. Run:**
 
 ```bash
 docker compose up -d --build frigate_bot
 docker compose logs -f frigate_bot
 ```
 
-В логе должно появиться `Subscribed to topics: ['frigate/reviews']` и `MQTT диспетчер запущен`.
+You should see `Subscribed to topics: ['frigate/reviews']`. Walk in front of a camera — the notification arrives when the event ends.
 
-**5. Сессия MTProto** (только для канала TG_MTPROTO):
+**5. MTProto session** (only for the `TG_MTPROTO` channel):
 
 ```bash
 docker compose exec -it frigate_bot python tg_client.py
 ```
 
-Интерактивно спросит телефон, код и пароль 2FA. Пока сессии нет, бот работает без MTProto (остальные режимы не страдают) и подхватывает сессию автоматически, как только она появится — рестарт не нужен.
+It asks for your phone, the code and the 2FA password once. Until the session exists the bot works without MTProto and picks the session up automatically when it appears — no restart needed.
 
-## ИИ-сводки в подписи (review.genai)
+## Configuration
 
-Сводку генерирует сам Frigate — бот только забирает готовую через API. Настраивается на стороне **Frigate** (не бота):
+Everything lives in `config.py` (never committed; `config.example.py` is the template).
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `ENABLED_CHANNELS` | `['TG_BOT']` | delivery channels: `TG_BOT`, `TG_MTPROTO`, or both |
+| `TG_BOT_CONFIG` | — | bot token and `chat_id` |
+| `TG_MTPROTO_CONFIG` | — | `api_id`, `api_hash`, session name, `chat_id` |
+| `FRIGATE_PUBLIC_URL` | `""` | your Frigate UI base URL (`http://192.168.1.10:5000` or `https://frigate.example.com`) — adds a review link at the bottom of the message; empty = no link |
+| `PRETTY_LABELS` | `'en'` | object labels in the caption: `'en'` / `'ru'` — emoji + playful name (dictionaries in `pretty_labels.py`, easy to add a language); `None` — raw Frigate labels (`person`, `car`) |
+| `GENAI_REVIEW_SHOW` | `True` | add Frigate's AI summary to the caption |
+| `GENAI_REVIEW_WAIT` | `25` | how long to wait for the summary, seconds from the start of processing |
+| `GENAI_REVIEW_POLL` | `2.0` | summary poll interval, seconds |
+| `CLIP_START_SHIFT` / `CLIP_END_SHIFT` | `5` / `5` | video padding before/after the event, seconds |
+| `CLIP_MAX_LEN` | `180` | maximum clip length, seconds — chosen so that with the default encoding settings the file fits the Bot API limit (~50 MB) |
+| `OUTPUT_WIDTH` / `OUTPUT_FPS` / `OUTPUT_QP` | `1024` / `25` / `26` | encoding parameters |
+
+### AI summaries (Frigate side)
+
+The summary is generated by Frigate itself; the bot only fetches it. Configure it in **Frigate**, not in the bot:
 
 ```yaml
 genai:
   gemini_cloud:
-    provider: gemini            # или openai / ollama / llamacpp
+    provider: gemini            # or openai / ollama / llamacpp
     api_key: "{FRIGATE_GENAI_API_KEY}"
     model: gemini-3.8-flash
 
 review:
   genai:
     enabled: true
-    preferred_language: Russian # сводки сразу на русском
-    # detections: true          # суммаризировать и detections, не только alerts
+    preferred_language: English
+    # detections: true          # also summarize detections, not only alerts
 ```
 
-Бот при каждом событии проверяет по `/api/config`, включена ли генерация и покрывает ли она severity события — если нет, сводку не ждёт. Ожидание идёт параллельно со всей обработкой (фото/видео) и ограничено таймаутом, алерт из-за сводки не задерживается дольше `REVIEW_GENAI_WAIT`.
+The bot checks `/api/config` to see whether summaries are enabled and whether they cover the event's severity; if not, it does not wait. Waiting runs in parallel with everything else and is capped by `GENAI_REVIEW_WAIT`, so a slow or missing summary never delays the alert by more than that.
 
-Имена людей (Face Recognition) и номера машин (LPR), если они включены во Frigate, добавляются к меткам в подписи автоматически: `👤 ЧЕЛОВЕЧЕ [Юра]`, `🚗 МАШИНА [А123ВС77]`. Это не связано с review.genai и работает всегда.
+## How it works
 
-## Логи
+```
+Frigate ──MQTT frigate/reviews──▶ mqtt_dispatcher ──▶ handle_review
+                                                        │  snapshots + clip (Frigate API, in parallel)
+                                                        │  ffmpeg: VAAPI / CPU
+                                                        │  caption: labels, zones, names, AI summary
+                                                        ▼
+                                                   notification ──▶ formatter ──▶ queue[TG_BOT]     ──▶ worker ──▶ Bot API
+                                                                ──▶ formatter ──▶ queue[TG_MTPROTO] ──▶ worker ──▶ Telethon
+```
 
-| Файл | Что это |
+1. **mqtt_dispatcher.py** subscribes to `frigate/reviews` and hands each message to a worker. Only `type: end` messages are processed — one per finished review item.
+2. **handle_review** (`notifier.py`) downloads the annotated snapshot of every detection and the recording clip for the event window (`/api/<camera>/start/<t1>/end/<t2>/clip.mp4`), both in parallel; encodes the clip with ffmpeg (h264_vaapi, or libx264 without a GPU); fetches event details for labels, zones, sub-labels and plates; waits for the GenAI summary (started at the very beginning, in the background); and builds a neutral *notification*: photos, video, caption.
+3. **Formatter** (`messenger_style`) turns the notification into channel messages according to the channel's `format_params`: album size, caption limit, video size limit. This is where an oversized video is dropped for the Bot API channel while MTProto still gets it.
+4. **Delivery queues**: every enabled channel has its own queue and worker. The worker owns the channel's lifecycle (the MTProto session lives inside the `TG_MTPROTO` worker) and sends messages one by one; a failed message is logged and never blocks the rest.
+
+Adding a channel = a formatter (or reusing `messenger_style` with other params), a transport function and an entry in `CHANNELS`, plus `<NAME>_CONFIG` in `config.py`.
+
+### Files
+
+| File | Role |
 |---|---|
-| `frigate_bot.log` | сервис (ротация 5 МБ × 3) |
-| `debug.log` | ручные запуски: отладка и создание сессии |
+| `mqtt_dispatcher.py` | service entry point: MQTT, queues, workers |
+| `notifier.py` | event handler, Frigate API, video pipeline, formatter, transports, delivery queues |
+| `tg_client.py` | Telethon (MTProto) client and session; `python tg_client.py` creates the session |
+| `pretty_labels.py` | emoji and label names per language |
+| `log_config.py` | logging setup |
+| `config.py` | your settings (from `config.example.py`) |
 
-## Отладка
+### Logs
 
-Обработчик события можно запустить напрямую, без MQTT — payload берётся из лога (строки `Payload: {...}`):
+| File | What |
+|---|---|
+| `frigate_bot.log` | the service (5 MB × 3, rotated) |
+| `debug.log` | manual runs: debugging and session creation |
+
+The files always contain everything, including DEBUG; `LOG_LEVEL` in `config.py` only sets what goes to the console (`docker compose logs`).
+
+Every event is logged with its review id, so `grep <review_id> frigate_bot.log` shows its whole path: snapshots, clip, encoding, summary, and delivery per channel.
+
+### Debugging
+
+Run the handler for one event directly, without MQTT — take the payload from the log (`Payload: {...}` lines):
 
 ```bash
 docker compose exec -it frigate_bot python notifier.py '<json payload>'
 ```
 
-Использует отдельную Telethon-сессию `*_debug` (создаётся так же: `python tg_client.py --debug`), поэтому не конфликтует с работающим сервисом.
+It uses a separate Telethon session (`*_debug`, created with `python tg_client.py --debug`), so it does not conflict with the running service.
 
-Либо отправить payload обратно в MQTT — сервис обработает его как настоящее событие:
+Or replay the last event through the running service:
 
 ```bash
-docker compose exec -T mosquitto mosquitto_pub -t frigate/reviews -m '<json payload>'
+./frigate_bot/replay.sh              # last event from the log
+./frigate_bot/replay.sh <logfile>    # last event from a specific log
 ```
-
-## Настройки (config.py)
-
-| Параметр | По умолчанию | Что делает |
-|---|---|---|
-| `FRIGATE_PUBLIC_URL` | `""` | URL веб-интерфейса Frigate (`http://192.168.1.10:5000` или `https://frigate.example.com`) — внизу сообщения будет ссылка на review; `""` — без ссылки |
-| `GENAI_REVIEW_SHOW` | `True` | добавлять в подпись ИИ-сводку review.genai из Frigate |
-| `GENAI_REVIEW_WAIT` | `25` | сколько ждать генерацию сводки с начала обработки, сек |
-| `GENAI_REVIEW_POLL` | `2.0` | интервал опроса готовности сводки, сек |
-| `EXPORT_START_SHIFT` / `EXPORT_END_SHIFT` | `5` / `5` | запас видео до/после события, сек |
-| `EXPORT_MAX_LEN` | `180` | максимум длины ролика, сек; подобрано опытным путём — при текущих параметрах кодирования итоговый файл укладывается в лимит Bot API (~50 МБ) |
-| `OUTPUT_WIDTH` / `OUTPUT_FPS` / `OUTPUT_QP` | `1024` / `25` / `26` | параметры кодирования |
