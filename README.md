@@ -18,8 +18,12 @@ Each channel has its own queue and worker, so a slow upload on one channel never
 Tested on **Frigate 0.18**.
 
 <p align="center">
-  <img src="docs/ride_ptz_cam.png" width="300" align="middle" alt="Car on the PTZ camera, with AI summary">
-  <img src="docs/ride_panorama_cam.png" width="300" align="middle" alt="Car on the panorama camera, with AI summary">
+  <img src="docs/ride_panorama_cam.png" width="360" alt="Car on the panorama camera, with AI summary">
+  <img src="docs/fella_panorama_cam.png" width="360" alt="Person on the panorama camera, with AI summary">
+</p>
+<p align="center">
+  <img src="docs/kitty_panorama_cam.png" width="360" alt="Cat on the panorama camera">
+  <img src="docs/kitty_bullet_cam.png" width="360" alt="Cat on the bullet camera">
 </p>
 
 ## Quick start
