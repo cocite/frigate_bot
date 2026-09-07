@@ -3,166 +3,111 @@ import json
 import sys
 import os
 import subprocess
-import logging
+import functools
 import time
 import asyncio
 from telethon.tl.types import InputMediaUploadedPhoto, InputMediaUploadedDocument, DocumentAttributeVideo, DocumentAttributeFilename
 import log_config
 import tg_client
-from config import (ENABLED_CHANNELS, TG_BOT_CONFIG, TG_MTPROTO_CONFIG, FRIGATE_PUBLIC_URL,
+from pretty_labels import LABEL_EMOJI, LABEL_NAMES
+from config import (ENABLED_CHANNELS, TG_BOT_CONFIG, TG_MTPROTO_CONFIG, FRIGATE_PUBLIC_URL, PRETTY_LABELS,
                     GENAI_REVIEW_SHOW, GENAI_REVIEW_WAIT, GENAI_REVIEW_POLL,
-                    EXPORT_START_SHIFT, EXPORT_END_SHIFT, EXPORT_MAX_LEN,
+                    CLIP_START_SHIFT, CLIP_END_SHIFT, CLIP_MAX_LEN,
                     OUTPUT_WIDTH, OUTPUT_FPS, OUTPUT_QP)
 
-# --- 1. КОНСТАНТЫ (пользовательские настройки — в config.py) ---
-# Директории
+# --- 1. CONSTANTS (user settings live in config.py) ---
+# Directories
 CLIP_DIR    = "/app/data/media"
-CLEANUP_INTERVAL = 3600           # период уборки старых медиа из CLIP_DIR, сек
+CLEANUP_INTERVAL = 3600           # how often old media in CLIP_DIR is cleaned up, seconds
 
-# Отправка в Telegram (параметры форматирования каналов — в CHANNELS, секция 6)
-BOT_API_TIMEOUT = 300             # сокет-таймаут Bot API (connect/write/read), сек
-DELIVERY_QUEUE_SIZE = 30          # сообщений в очереди доставки каждого канала
+# Telegram delivery (per-channel format params are in CHANNELS, section 6)
+BOT_API_TIMEOUT = 300             # Bot API socket timeout (connect/write/read), seconds
+DELIVERY_QUEUE_SIZE = 30          # messages per channel delivery queue
 
 # Frigate API
 FRIGATE_URL = "http://frigate:5000"
-FRIGATE_TIMEOUT = (5, 15)          # (подключение, чтение)
-FRIGATE_CONFIG_TTL = 300           # кэш конфига Frigate (проверка, что genai включён), сек
-EXPORT_WAIT_TIMEOUT = 60
-EXPORT_POLL_FIRST = 0.5           # первый опрос статуса
-EXPORT_POLL_MAX = 3.0             # потолок интервала
-EXPORT_POLL_FACTOR = 1.6
-# 0.18: размеченные снапшоты только через API, файлов .jpg на диске больше нет
+FRIGATE_TIMEOUT = (5, 15)          # (connect, read)
+FRIGATE_CONFIG_TTL = 300           # Frigate config cache (used to check whether genai is enabled), seconds
+# Frigate 0.18: annotated snapshots come only from the API, there are no .jpg files on disk
 SNAPSHOT_PARAMS = {"bounding_box": 1, "timestamp": 1, "crop": 1, "quality": 80}
 
-# Подписи детекций
-LABEL_DICT = {
-    "person": {"emoji": "👤", "name": "ЧЕЛОВЕЧЕ"},
-    "cat": {"emoji": "🐈", "name": "КОШЕН"},
-    "dog": {"emoji": "🐕", "name": "СОБАКЕН"},
-    "bird": {"emoji": "🐦", "name": "ПТИЦА"},
-    "car": {"emoji": "🚗", "name": "МАШИНА"},
-    "face": {"emoji": "🧔‍♀️", "name": "ФЭЙС"},
-    "fox": {"emoji": "🦊", "name": "ЛИС"},
-    "bicycle": {"emoji": "🚲", "name": "велосипед"},
-    "motorcycle": {"emoji": "🏍️", "name": "мотоцикл"},
-    "bus": {"emoji": "🚌", "name": "автобус"},
-    "truck": {"emoji": "🚚", "name": "грузовик"}
-}
+# Caption labels: the language must exist in pretty_labels.py
+if PRETTY_LABELS and PRETTY_LABELS not in LABEL_NAMES:
+    raise ValueError(f"PRETTY_LABELS={PRETTY_LABELS!r}: no such language in pretty_labels.py "
+                     f"(available: {list(LABEL_NAMES)}); None = raw labels")
 
-# --- 2. ЛОГГЕР ---
-# Хендлеры настраивает entry point через log_config.setup()
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+# --- 2. LOGGER ---
+# Handlers are set up by the entry point via log_config.setup(); console level comes from config.LOG_LEVEL
+logger = log_config.get_logger(__name__)
 # --- 3. FRIGATE API ---
 
 def _fetch_snapshot(detection_id, dest_path):
-    """Скачивает размеченный снапшот события через API Frigate."""
+    """Downloads the annotated snapshot of a detection via the Frigate API."""
     try:
         r = requests.get(f"{FRIGATE_URL}/api/events/{detection_id}/snapshot.jpg",
                          params=SNAPSHOT_PARAMS, timeout=FRIGATE_TIMEOUT)
         if r.status_code != 200 or not r.content:
-            logger.info("Снапшот %s недоступен: HTTP %s", detection_id, r.status_code)
+            logger.warning("Snapshot %s unavailable: HTTP %s", detection_id, r.status_code)
             return False
         with open(dest_path, "wb") as f:
             f.write(r.content)
         return True
     except requests.RequestException as e:
-        logger.error("Ошибка загрузки снапшота %s: %s", detection_id, e)
+        logger.error("Snapshot %s download failed: %s", detection_id, e)
         return False
 
+def _fetch_clip(camera, start_int, end_int, dest_path):
+    """Downloads the recording clip for a time range: Frigate concatenates the segments
+    without re-encoding and streams the result. Written to disk in chunks so a 100+ MB clip
+    never sits in memory."""
+    try:
+        with requests.get(f"{FRIGATE_URL}/api/{camera}/start/{start_int}/end/{end_int}/clip.mp4",
+                          stream=True, timeout=FRIGATE_TIMEOUT) as r:
+            if r.status_code != 200:
+                logger.error("Clip unavailable: HTTP %s %s", r.status_code, r.text[:200])
+                return False
+            with open(dest_path, "wb") as f:
+                for chunk in r.iter_content(1 << 20):
+                    f.write(chunk)
+        logger.info("Clip downloaded: %.1f MB", os.path.getsize(dest_path) / 1048576)
+        return True
+    except requests.RequestException as e:
+        logger.error("Clip download failed: %s", e)
+        return False
+
+
 def _fetch_detection(detection_id):
-    """Детали события из Frigate. Возвращает dict или None."""
+    """Details of a detection (Frigate event). Returns a dict or None."""
     try:
         r = requests.get(f"{FRIGATE_URL}/api/events/{detection_id}", timeout=FRIGATE_TIMEOUT)
         r.raise_for_status()
         return r.json()
     except requests.RequestException as e:
-        logger.error("Не удалось получить событие %s: %s", detection_id, e)
+        logger.error("Event %s fetch failed: %s", detection_id, e)
         return None
-
-def _request_export(camera, start_int, end_int):
-    """Просит Frigate собрать ролик. Возвращает export_id или None."""
-    try:
-        r = requests.post(f"{FRIGATE_URL}/api/export/{camera}/start/{start_int}/end/{end_int}",
-                          json={"source": "recordings", "name": f"tg_{camera}_{start_int}"},
-                          timeout=FRIGATE_TIMEOUT)
-    except requests.RequestException as e:
-        logger.error("Не удалось запросить экспорт: %s", e)
-        return None
-    if r.status_code not in (200, 202):
-        logger.error("Экспорт не создан: HTTP %s %s", r.status_code, r.text[:200])
-        return None
-    export_id = (r.json() or {}).get("export_id")
-    logger.info("Экспорт поставлен в очередь: %s", export_id)
-    return export_id
-
-def _export_record(export_id):
-    """Запись об экспорте (in_progress, video_path) или None, если её ещё нет / не получена.
-    Параметр '_' обходит кеш nginx — он подтверждённо кеширует /api/ на несколько секунд."""
-    try:
-        r = requests.get(f"{FRIGATE_URL}/api/exports/{export_id}",
-                         params={"_": int(time.time() * 1000)},
-                         timeout=FRIGATE_TIMEOUT)
-        return r.json() if r.status_code == 200 else None
-    except (requests.RequestException, ValueError):
-        return None
-
-async def _wait_export(export_id):
-    """Ждёт готовности экспорта. Возвращает путь к файлу или None."""
-    started, deadline = time.time(), time.time() + EXPORT_WAIT_TIMEOUT
-    interval = EXPORT_POLL_FIRST
-    while time.time() < deadline:
-        rec = await asyncio.to_thread(_export_record, export_id)
-
-        if rec and not rec.get("in_progress", True):
-            path = rec.get("video_path")
-            if path and os.path.exists(path):
-                logger.info("Экспорт %s готов за %.1f c (%.1f МБ)",
-                            export_id, time.time() - started, os.path.getsize(path) / 1048576)
-                return path
-            logger.error("Экспорт %s завершён, но файла нет: %s", export_id, path)
-            return None
-
-        await asyncio.sleep(interval)
-        interval = min(interval * EXPORT_POLL_FACTOR, EXPORT_POLL_MAX)
-
-    logger.error("Экспорт %s не готов за %d c", export_id, EXPORT_WAIT_TIMEOUT)
-    return None
-
-def _delete_export(export_id):
-    """Убирает экспорт: /media/frigate смонтирован только на чтение, удалять можно лишь через API."""
-    try:
-        r = requests.post(f"{FRIGATE_URL}/api/exports/delete", json={"ids": [export_id]},
-                          timeout=FRIGATE_TIMEOUT)
-        if r.status_code == 200:
-            logger.info("Экспорт %s удалён", export_id)
-        else:
-            logger.error("Экспорт %s не удалён: HTTP %s %s", export_id, r.status_code, r.text[:150])
-    except requests.RequestException as e:
-        logger.error("Ошибка удаления экспорта %s: %s", export_id, e)
 
 def _fetch_review_metadata(review_id):
-    """Сводка review.genai из Frigate. Возвращает dict (data.metadata) или None.
-    Параметр '_' обходит кеш nginx — как в _export_record."""
+    """review.genai summary from Frigate. Returns a dict (data.metadata) or None.
+    The '_' parameter bypasses the nginx cache: Frigate caches /api/ JSON responses for 5 s."""
     try:
         r = requests.get(f"{FRIGATE_URL}/api/review/{review_id}",
                          params={"_": int(time.time() * 1000)},
                          timeout=FRIGATE_TIMEOUT)
         if r.status_code != 200:
-            logger.info("Сводка review %s недоступна: HTTP %s", review_id, r.status_code)
+            logger.info("Review %s summary unavailable: HTTP %s", review_id, r.status_code)
             return None
         return (r.json() or {}).get("data", {}).get("metadata")
     except (requests.RequestException, ValueError) as e:
-        logger.error("Ошибка запроса сводки review %s: %s", review_id, e)
+        logger.error("Review %s summary request failed: %s", review_id, e)
         return None
 
 _frigate_config_cache = {"data": None, "ts": 0.0}
 
 async def _get_review_summary(camera, severity, review_id):
-    """Фоновая задача: проверяет по конфигу Frigate, что сводка вообще будет
-    (review.genai включён и суммаризирует данный severity), и ждёт её до
-    GENAI_REVIEW_WAIT сек. Стартует в самом начале обработки события,
-    поэтому лог времени — полное время генерации со стороны Frigate."""
+    """Background task: checks in the Frigate config that a summary is coming at all
+    (review.genai enabled and covering this severity), then waits for it up to
+    GENAI_REVIEW_WAIT seconds. Started at the very beginning of event processing,
+    so the logged time is the full generation time on the Frigate side."""
     if time.time() - _frigate_config_cache["ts"] > FRIGATE_CONFIG_TTL:
         try:
             r = await asyncio.to_thread(
@@ -171,41 +116,44 @@ async def _get_review_summary(camera, severity, review_id):
             _frigate_config_cache["data"] = r.json()
             _frigate_config_cache["ts"] = time.time()
         except (requests.RequestException, ValueError) as e:
-            logger.error("Не удалось получить конфиг Frigate: %s", e)
+            logger.error("Frigate config fetch failed: %s", e)
 
     cfg = _frigate_config_cache["data"]
     if cfg is not None:
         genai_cfg = (cfg.get("cameras", {}).get(camera, {}).get("review", {}).get("genai")
                      or cfg.get("review", {}).get("genai") or {})
         if not genai_cfg.get("enabled"):
-            logger.info("review.genai выключен во Frigate — сводку не ждём.")
+            logger.debug("Review %s: review.genai is disabled in Frigate, not waiting for a summary", review_id)
             return None
         if not (genai_cfg.get("alerts", True) if severity == "alert"
                 else genai_cfg.get("detections", False)):
-            logger.info("review.genai не суммаризирует severity='%s' — сводку не ждём.", severity)
+            logger.debug("Review %s: review.genai does not summarize severity=%s, not waiting", review_id, severity)
             return None
-        logger.info("review.genai включён (alerts=%s, detections=%s) — ждём сводку для severity='%s'.",
-                    genai_cfg.get("alerts", True), genai_cfg.get("detections", False), severity)
-    # конфиг получить не удалось — ждём как обычно, хуже не станет
+        logger.debug("Review %s: waiting for review.genai summary (severity=%s; alerts=%s, detections=%s)",
+                     review_id, severity, genai_cfg.get("alerts", True), genai_cfg.get("detections", False))
+    # config unavailable — wait as usual, nothing to lose
 
     started = time.time()
     deadline = started + GENAI_REVIEW_WAIT
     while True:
         meta = await asyncio.to_thread(_fetch_review_metadata, review_id)
         if meta:
-            logger.info("Сводка review.genai готова через %.1f c: %s",
-                        time.time() - started, json.dumps(meta, ensure_ascii=False))
+            logger.info("Review %s: summary ready in %.1f s (threat level %s)",
+                        review_id, time.time() - started, meta.get("potential_threat_level"))
+            logger.debug("Review %s: summary %s", review_id, json.dumps(meta, ensure_ascii=False))
             return meta
         if time.time() >= deadline:
-            logger.info("Сводка review.genai для %s не появилась за %d c.",
-                        review_id, GENAI_REVIEW_WAIT)
+            logger.warning("Review %s: summary not ready after %d s — sending without it",
+                           review_id, GENAI_REVIEW_WAIT)
             return None
         await asyncio.sleep(GENAI_REVIEW_POLL)
 
-# --- 4. МЕДИА ---
+# --- 4. MEDIA ---
 
+@functools.lru_cache(maxsize=None)   # the device never changes — look it up and log it once
 def _find_vaapi_device():
-    """Ищет render-узел Intel (vendor 0x8086) в /dev/dri. Возвращает путь или None."""
+    """Looks for an Intel render node (vendor 0x8086) in /dev/dri. Returns the path or None."""
+    device = None
     try:
         dri_path = "/dev/dri"
         if os.path.isdir(dri_path):
@@ -215,23 +163,25 @@ def _find_vaapi_device():
                     if os.path.exists(vendor_path):
                         with open(vendor_path) as f:
                             if f.read().strip() == "0x8086":
-                                return os.path.join(dri_path, node)
+                                device = os.path.join(dri_path, node)
+                                break
     except Exception as e:
-        logger.error(f"Ошибка при поиске устройства VAAPI: {e}")
-    return None
+        logger.error(f"VAAPI device lookup failed: {e}")
+    if device:
+        logger.info("Intel VAAPI found: %s", device)
+    else:
+        logger.warning("Intel VAAPI not found — encoding on CPU (libx264)")
+    return device
 
-async def _prepare_video(export_path, review_dir):
-    """Сжимает экспорт (VAAPI или CPU), делает превью и метаданные.
-    Возвращает media item для отправки или None."""
+async def _prepare_video(source_path, review_dir):
+    """Compresses the clip (VAAPI or CPU), extracts a thumbnail and metadata.
+    Returns a media item for sending or None."""
     compressed_path = os.path.join(review_dir, "final.mp4")
+    started = time.time()
 
     vaapi_device = _find_vaapi_device()
-    if vaapi_device:
-        logger.info(f"Intel VAAPI: {vaapi_device}")
-    else:
-        logger.warning("Intel VAAPI не найден — видео будет кодироваться на CPU (libx264): медленнее и грузит процессор.")
 
-    # Аппаратная часть: флаги входа, фильтр масштабирования, кодек с его настройкой качества.
+    # Hardware-dependent part: input flags, scale filter, encoder with its quality setting.
     if vaapi_device:
         hw_input = ["-hwaccel", "vaapi", "-hwaccel_device", vaapi_device, "-hwaccel_output_format", "vaapi"]
         scale    = f"scale_vaapi=w={OUTPUT_WIDTH}:h=-2"
@@ -244,10 +194,10 @@ async def _prepare_video(export_path, review_dir):
     cmd = [
         "ffmpeg", "-y", "-v", "error",
         *hw_input,
-        "-i", export_path,
+        "-i", source_path,
         "-vf", f"fps={OUTPUT_FPS},{scale}",
         "-map", "0:v:0",
-        "-map", "0:a:0?",          # '?' — дорожки может не быть, это не ошибка
+        "-map", "0:a:0?",          # '?' — the audio track may be missing, that is not an error
         *encoder,
         "-g", str(OUTPUT_FPS), "-bf", "2",
         "-c:a", "aac", "-b:a", "64k", "-ar", "16000", "-ac", "1",
@@ -258,18 +208,19 @@ async def _prepare_video(export_path, review_dir):
     try:
         await asyncio.to_thread(subprocess.run, cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg завершился с ошибкой. Код: {e.returncode}\nstderr:\n{e.stderr}")
+        logger.error(f"ffmpeg failed (exit {e.returncode}):\n{e.stderr}")
         return None
     except Exception:
-        logger.exception("Критическая ошибка на этапе обработки видеофайла.")
+        logger.exception("Video encoding failed unexpectedly")
         return None
 
     if not (os.path.exists(compressed_path) and os.path.getsize(compressed_path) > 1024):
-        logger.error("FFmpeg отработал, но итоговый файл отсутствует или подозрительно мал.")
+        logger.error("ffmpeg finished but the output file is missing or suspiciously small")
         return None
 
     size_mb = os.path.getsize(compressed_path) / (1024 * 1024)
-    logger.info("Видео сжато: %s (%.2f МБ)", compressed_path, size_mb)
+    logger.info("Video encoded in %.1f s (%s): %s (%.2f MB)",
+                time.time() - started, "VAAPI" if vaapi_device else "CPU", compressed_path, size_mb)
 
     thumb_path = os.path.join(review_dir, "thumb.jpg")
     try:
@@ -278,14 +229,14 @@ async def _prepare_video(export_path, review_dir):
             "-ss", "00:00:01.00",
             "-i", compressed_path,
             "-frames:v", "1",
-            # Bot API: не больше 320 px по длинной стороне и 200 КБ
+            # Bot API: at most 320 px on the longer side and 200 KB
             "-vf", "scale=320:-2",
             "-q:v", "5",
             thumb_path
         ]
         await asyncio.to_thread(subprocess.run, thumb_cmd, check=True, capture_output=True, text=True)
     except Exception as e:
-        logger.error("Не удалось извлечь превью: %s", getattr(e, "stderr", e))
+        logger.warning("Thumbnail extraction failed: %s", getattr(e, "stderr", e))
         thumb_path = None
 
     video_meta = {}
@@ -305,25 +256,26 @@ async def _prepare_video(export_path, review_dir):
                       'duration': int(float(dur))}
     except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError,
             IndexError, TypeError, ValueError) as e:
-        logger.error(f"Не удалось получить метаданные видео: {e}")
+        logger.warning(f"Video metadata (ffprobe) failed: {e}")
 
     return {'type': 'video', 'path': compressed_path, 'thumb_path': thumb_path, 'meta': video_meta}
 
 async def cleanup_worker():
-    """Периодическая уборка CLIP_DIR: удаляет медиа старше суток.
-    Запускается entry point'ом сервиса; раньше жила в горячем пути каждого события."""
-    os.makedirs(CLIP_DIR, exist_ok=True)   # каталог нужен до первого find
+    """Periodic cleanup of CLIP_DIR: deletes media older than a day.
+    Started by the service entry point."""
+    os.makedirs(CLIP_DIR, exist_ok=True)   # the directory must exist before the first find
     while True:
         await asyncio.to_thread(subprocess.run, ["find", CLIP_DIR, "-type", "f", "-mmin", "+1440", "-delete"])
         await asyncio.to_thread(subprocess.run, ["find", CLIP_DIR, "-type", "d", "-empty", "-delete"])
         await asyncio.sleep(CLEANUP_INTERVAL)
 
-# --- 5. ФОРМАТТЕР ---
-# Превращает нейтральное уведомление в список сообщений канала.
-# Словарь сообщений — контракт пары «форматтер ↔ транспорт» одного канала.
+# --- 5. FORMATTER ---
+# Turns an internal notification (photos, video, caption) into the channel's messages.
+# The message dict is the contract between the formatter and the transport of one channel:
+#   {'kind': 'media_group', 'items': [media...], 'caption': ''}  /  {'kind': 'text', 'text': ...}
 
 def _split_text(text, limit):
-    """Режет текст под лимит: по границе предложения, потом строки, потом слова."""
+    """Splits text to fit the limit: at the last sentence end or line break, else at a space, else hard cut."""
     chunks = []
     while len(text) > limit:
         cut = max(text.rfind(". ", 0, limit), text.rfind("\n", 0, limit))
@@ -338,8 +290,9 @@ def _split_text(text, limit):
     return chunks
 
 def messenger_style(notification, params):
-    """Общий форматтер мессенджеров: медиа альбомами, подпись к последнему альбому,
-    не влезла — отдельным сообщением. params — format_params канала."""
+    """Common messenger formatter: media in albums; the caption goes on the last media message
+    if it fits caption_limit, otherwise (or when there is no media) as separate text messages
+    split by message_limit. params — the channel's format_params."""
     media = [{'type': 'photo', 'path': path} for path in notification['photos']]
     separate_videos = []
 
@@ -347,7 +300,7 @@ def messenger_style(notification, params):
     if video:
         size_mb = os.path.getsize(video['path']) / 1048576
         if params['video_mb'] is not None and size_mb > params['video_mb']:
-            logger.warning("Видео %.1f МБ превышает лимит канала (%d МБ) — уведомление уйдёт без видео.",
+            logger.warning("Video %.1f MB exceeds the channel limit (%d MB) — sending without video",
                            size_mb, params['video_mb'])
         elif params['video_in_album']:
             media.append(video)
@@ -367,45 +320,46 @@ def messenger_style(notification, params):
                          for chunk in _split_text(caption, params['message_limit'])]
     return messages
 
-# --- 6. ТРАНСПОРТЫ И КАНАЛЫ ---
+# --- 6. TRANSPORTS AND CHANNELS ---
 
 def _send_bot_api_request(method, data, file_paths=None, max_retries=5):
-    """(Bot API) Отправляет запрос. Возвращает успешный response или кидает RuntimeError.
-    Повторяет попытки при rate limit (429), ошибках Telegram (5xx) и сетевых сбоях."""
+    """(Bot API) Sends a request. Returns the successful response or raises RuntimeError.
+    Retries on rate limit (429), Telegram errors (5xx) and network failures."""
     url = f"https://api.telegram.org/bot{TG_BOT_CONFIG['token']}/{method}"
     for _ in range(max_retries):
         files = {name: open(path, 'rb') for name, path in file_paths.items()} if file_paths else None
         try:
-            # Один щедрый таймаут на всё (connect/write/read): при параллельной отправке
-            # в несколько каналов аплинк насыщается, и write легально блокируется надолго —
-            # раздельный короткий connect-таймаут душил именно отправку тела запроса.
-            # Щедрость важна и против дублей: ретрай после таймаута может повторить
-            # уже принятую Telegram'ом группу.
+            # One generous timeout for everything (connect/write/read): with several channels
+            # uploading in parallel the uplink saturates and write legitimately blocks for a long
+            # time — a separate short connect timeout was killing exactly the request body upload.
+            # Being generous also guards against duplicates: a retry after a timeout may resend
+            # a media group Telegram has already accepted.
             response = requests.post(url, data=data, files=files, timeout=BOT_API_TIMEOUT)
             if response.status_code == 429:
                 retry_after = response.json().get("parameters", {}).get("retry_after", 5)
-                logger.warning(f"[BotAPI] Rate limit. Повтор через {retry_after} сек.")
+                logger.warning(f"[TG:BotAPI] rate limited — retrying in {retry_after}s")
                 time.sleep(retry_after + 1)
                 continue
             if response.status_code >= 500:
-                logger.warning(f"[BotAPI] HTTP {response.status_code} от Telegram. Повтор через 5 сек.")
+                logger.warning(f"[TG:BotAPI] HTTP {response.status_code} from Telegram — retrying in 5s")
                 time.sleep(5)
                 continue
             if response.status_code != 200:
-                # 4xx — постоянная ошибка, повторять бессмысленно
-                raise RuntimeError(f"[BotAPI] {method}: HTTP {response.status_code}, {response.text[:300]}"
+                # 4xx is a permanent error, retrying is pointless
+                raise RuntimeError(f"[TG:BotAPI] {method}: HTTP {response.status_code}, {response.text[:300]}"
                                    f" (files: {list(file_paths) if file_paths else '-'})")
             return response
         except requests.RequestException as e:
-            logger.error(f"[BotAPI] Сетевая ошибка: {e}")
+            logger.warning(f"[TG:BotAPI] network error: {e} — retrying in 5s")
             time.sleep(5)
         finally:
             if files:
                 for f in files.values(): f.close()
-    raise RuntimeError(f"[BotAPI] Запрос '{method}' провалился после {max_retries} попыток.")
+    raise RuntimeError(f"[TG:BotAPI] {method} failed after {max_retries} attempts")
 
 def _bot_media_fields(item, fields, files):
-    """(Bot API) Заполняет поля видео (размеры, длительность, превью) и регистрирует файлы."""
+    """(Bot API) Registers the media file (and the thumbnail) for upload;
+    for a video also fills width/height/duration."""
     attach_name = os.path.basename(item['path'])
     files[attach_name] = item['path']
     if item['type'] == 'video':
@@ -419,7 +373,7 @@ def _bot_media_fields(item, fields, files):
     return attach_name
 
 async def _deliver_bot(msg):
-    """(Bot API) Исполняет одно сообщение канала."""
+    """(Bot API) Sends one channel message."""
     if msg['kind'] == 'text':
         await asyncio.to_thread(_send_bot_api_request, "sendMessage",
                                 data={"chat_id": TG_BOT_CONFIG['chat_id'], "text": msg['text']})
@@ -427,7 +381,7 @@ async def _deliver_bot(msg):
 
     items = msg['items']
     if len(items) == 1:
-        # sendMediaGroup требует 2-10 элементов — одиночное медиа шлём своим методом
+        # sendMediaGroup requires 2–10 items — a single media item goes through its own method (sendPhoto / sendVideo)
         item = items[0]
         field = "photo" if item['type'] == 'photo' else "video"
         data, files = {"chat_id": TG_BOT_CONFIG['chat_id']}, {}
@@ -451,41 +405,38 @@ async def _deliver_bot(msg):
     await asyncio.to_thread(_send_bot_api_request, "sendMediaGroup", data=data, file_paths=files_to_attach)
 
 async def _mtproto_send_media_group(client, chat_id, media_objects, caption=""):
-    """(MTProto) Отправляет альбом из уже загруженных медиа и логирует ответ сервера."""
-    logger.info(f"[MTProto] Отправка медиагруппы из {len(media_objects)} объектов...")
+    """(MTProto) Sends an album of already uploaded media and logs the server response."""
     sent_messages = await asyncio.wait_for(
         client.send_file(chat_id, file=media_objects, caption=caption),
-        timeout=180   # файлы уже загружены — это только сборка альбома
+        timeout=180   # files are already uploaded — this is only the album assembly
     )
 
     if not sent_messages:
-        logger.error("[MTProto] Сервер не вернул информацию об отправленных сообщениях!")
+        logger.error("[TG:MTProto] server returned no message info after send")
         return
     if not isinstance(sent_messages, list):
         sent_messages = [sent_messages]
 
-    logger.info(f"[MTProto] Отправлено {len(sent_messages)} сообщений (ids: {[m.id for m in sent_messages]}).")
+    logger.debug(f"[TG:MTProto] sent {len(sent_messages)} messages (ids: {[m.id for m in sent_messages]})")
     for msg in sent_messages:
         info = f"id={msg.id} group={msg.grouped_id} media={type(msg.media).__name__ if msg.media else '-'}"
         attrs = getattr(getattr(msg.media, 'document', None), 'attributes', None) or []
         video = next((a for a in attrs if type(a).__name__ == 'DocumentAttributeVideo'), None)
         if video:
-            info += f" video={video.w}x{video.h} {video.duration}с"
-        logger.debug(f"[MTProto]   {info}")
+            info += f" video={video.w}x{video.h} {video.duration}s"
+        logger.debug(f"[TG:MTProto]   {info}")
 
 async def _deliver_mtproto(msg):
-    """(MTProto) Исполняет одно сообщение канала."""
+    """(MTProto) Sends one channel message."""
     client = await tg_client.ensure()
 
     if msg['kind'] == 'text':
         await asyncio.wait_for(client.send_message(TG_MTPROTO_CONFIG['chat_id'], msg['text']), timeout=30)
         return
 
-    # Загрузку не ограничиваем: медленная сеть — не сбой; мёртвую сеть
-    # Telethon добьёт сам (reconnect x10 → исключение)
+    # Uploads are not time-limited: a slow network is not a failure, and a dead one
+    # Telethon gives up on itself (connection_retries=10 → exception)
     items = msg['items']
-    total_mb = sum(os.path.getsize(i['path']) for i in items) / 1048576
-    logger.info(f"[MTProto] Загрузка {len(items)} файлов ({total_mb:.1f} МБ)...")
     media_objects = []
     for item in items:
         if item['type'] == 'photo':
@@ -501,52 +452,66 @@ async def _deliver_mtproto(msg):
             media_objects.append(InputMediaUploadedDocument(file=video_handle, thumb=thumb_handle, attributes=attributes, mime_type='video/mp4'))
     await _mtproto_send_media_group(client, TG_MTPROTO_CONFIG['chat_id'], media_objects, msg['caption'])
 
+# Channel registry. tag — log label; formatter + format_params — how a notification
+# becomes messages; transport — how a message is sent; lifecycle (optional) — async
+# context manager the delivery worker opens for its lifetime (MTProto session).
+# A channel is active when its name is in ENABLED_CHANNELS and <NAME>_CONFIG exists in config.py.
 CHANNELS = {
     'TG_BOT': {
+        'tag': 'TG:BotAPI',                 # channel tag in logs
         'formatter': messenger_style,
         'transport': _deliver_bot,
         'format_params': dict(album_size=8, caption_limit=1024, message_limit=4096,
-                              video_mb=49,    # лимит Bot API на загрузку (~50 МБ)
+                              video_mb=49,    # Bot API upload limit (~50 MB)
                               video_in_album=True),
     },
     'TG_MTPROTO': {
+        'tag': 'TG:MTProto',
         'formatter': messenger_style,
         'transport': _deliver_mtproto,
-        'lifecycle': tg_client.session,   # канал сам владеет своей MTProto-сессией
-
+        'lifecycle': tg_client.session,   # the channel owns its MTProto session (opened by its delivery worker)
         'format_params': dict(album_size=8, caption_limit=1024, message_limit=4096,
-                              video_mb=None,  # 2 ГБ, фактически без лимита
+                              video_mb=None,  # 2 GB, effectively no limit
                               video_in_album=True),
     },
 }
 
-# --- 7. ОЧЕРЕДИ ДОСТАВКИ ---
+# --- 7. DELIVERY QUEUES ---
 
-# Очереди доставки: у каждого включённого канала своя, каналы разгребают их
-# в своём темпе — медленный не тормозит быстрых (см. delivery_queues_analysis.md)
+# Delivery queues: one per enabled channel, each channel drains its own at its own pace —
+# a slow channel never delays a fast one
 _delivery_queues = {}
 
+def _describe(msg):
+    """Short message description for logs: 'media_group (4 files, 18.3 MB)' / 'text (1420 chars)'."""
+    if msg['kind'] == 'media_group':
+        mb = sum(os.path.getsize(i['path']) for i in msg['items']) / 1048576
+        return f"media_group ({len(msg['items'])} files, {mb:.1f} MB)"
+    return f"text ({len(msg['text'])} chars)"
+
 async def _delivery_loop(channel):
-    """Вечный цикл воркера: взял (review_id, msg) из очереди — отдал транспорту.
-    Ошибка сообщения логируется и не убивает воркера."""
+    """Endless worker loop: take (review_id, msg) from the queue, hand it to the transport.
+    A failed message is logged and does not kill the worker."""
     q = _delivery_queues[channel]
-    transport = CHANNELS[channel]['transport']
-    logger.info(f"[{channel}] воркер доставки запущен.")
+    tag, transport = CHANNELS[channel]['tag'], CHANNELS[channel]['transport']
+    logger.info(f"[{tag}] delivery worker started")
     while True:
         review_id, msg = await q.get()
+        logger.info(f"[{tag}] {review_id}: sending {_describe(msg)}, queue {q.qsize()}")
+        started = time.monotonic()
         try:
             await transport(msg)
-            logger.info(f"<- [{channel}] {review_id}: {msg['kind']} доставлено (в очереди {q.qsize()}).")
+            logger.info(f"[{tag}] {review_id}: {msg['kind']} delivered in {time.monotonic() - started:.1f} s, queue {q.qsize()}")
         except tg_client.NotAuthorized as e:
-            logger.error(f"<!> [{channel}] {review_id}: {e}")
+            logger.error(f"[{tag}] {review_id}: {e}")
         except Exception:
-            logger.exception(f"<!> [{channel}] {review_id}: ПРОВАЛ {msg['kind']}.")
+            logger.exception(f"[{tag}] {review_id}: {msg['kind']} FAILED")
         finally:
             q.task_done()
 
 async def _delivery_worker(channel, debug=False):
-    """Воркер канала. Если у канала есть lifecycle (сессия MTProto) —
-    владеет им: открывает на время своей жизни."""
+    """Channel worker. If the channel has a lifecycle (MTProto session),
+    the worker owns it: opens it for its whole lifetime."""
     lifecycle = CHANNELS[channel].get('lifecycle')
     if lifecycle:
         async with lifecycle(debug):
@@ -555,61 +520,65 @@ async def _delivery_worker(channel, debug=False):
         await _delivery_loop(channel)
 
 def start_delivery_workers(debug=False):
-    """Создаёт очереди и воркеров доставки для включённых каналов.
-    Зовётся entry point'ом; возвращённые task'и держать — иначе соберёт GC."""
+    """Creates the queues and delivery workers for the enabled channels.
+    Called by the entry point; keep the returned tasks referenced, otherwise they can be garbage-collected."""
     tasks = []
     for channel in ENABLED_CHANNELS:
         if channel not in CHANNELS:
-            logger.error(f"Неизвестный канал '{channel}' в ENABLED_CHANNELS — пропущен.")
+            logger.error(f"Unknown channel '{channel}' in ENABLED_CHANNELS — skipped")
             continue
         _delivery_queues[channel] = asyncio.Queue(maxsize=DELIVERY_QUEUE_SIZE)
         tasks.append(asyncio.create_task(_delivery_worker(channel, debug), name=f"delivery-{channel}"))
     return tasks
 
 async def flush_delivery_queues():
-    """Дождаться, пока воркеры разгребут все очереди (debug-режим)."""
+    """Waits until the workers drain all queues (debug run)."""
     await asyncio.gather(*(q.join() for q in _delivery_queues.values()))
 
 async def dispatch_notification(notification):
-    """Форматирует уведомление под включённые каналы и раскладывает готовые
-    сообщения по их очередям. Дальше каждый канал доставляет в своём темпе."""
+    """Formats the notification for every enabled channel and puts the resulting messages
+    into the channel queues. From there each channel delivers at its own pace."""
     rid = notification['review_id']
     if not _delivery_queues:
-        logger.error(f"{rid}: воркеры доставки не запущены (start_delivery_workers) — уведомление потеряно.")
+        logger.error(f"{rid}: delivery workers not started (start_delivery_workers) — notification lost")
         return
     for channel, q in _delivery_queues.items():
-        ch = CHANNELS[channel]
+        ch, tag = CHANNELS[channel], CHANNELS[channel]['tag']
         try:
             messages = ch['formatter'](notification, ch['format_params'])
         except Exception:
-            logger.exception(f"<!> [{channel}] {rid}: ошибка форматтера — событие пропущено.")
+            logger.exception(f"[{tag}] {rid}: formatter failed — event skipped")
             continue
         if q.full():
-            logger.warning(f"[{channel}] очередь заполнена ({q.qsize()}) — канал не успевает, ждём место.")
+            logger.warning(f"[{tag}] queue is full ({q.qsize()}) — channel can't keep up, waiting for a slot")
         for msg in messages:
             await q.put((rid, msg))
-        logger.info(f"-> [{channel}] {rid}: {len(messages)} сообщений в очередь (в очереди {q.qsize()}).")
+        logger.info(f"[{tag}] {rid}: {len(messages)} messages enqueued, queue {q.qsize()}")
 
-# --- 8. ОБРАБОТЧИК СОБЫТИЯ ---
+# --- 8. REVIEW HANDLER ---
 
 def _time_from_id(detection_id): return float(detection_id.split('-')[0])
 def _format_time(ts): return time.strftime('%H:%M:%S', time.localtime(ts))
 
 def _build_caption(raw_events, start_time, end_time, camera, review_id, review_metadata):
-    """Собирает текст уведомления: время, метки с именами/номерами, зоны,
-    сводка review.genai, ссылка на review. Чистая функция без I/O."""
-    pretty_labels, zones = set(), set()
+    """Builds the notification text: time span, labels with names/plates, zones,
+    review.genai summary, review link. Pure function, no I/O."""
+    labels, zones = set(), set()
     for raw in raw_events:
         zones.update(raw.get("zones", []))
-        label_info = LABEL_DICT.get(raw.get("label", "UFO"), {"emoji": "❓", "name": "НЕЧТО"})
+        label = raw.get("label", "*")
+        if PRETTY_LABELS:
+            emoji = LABEL_EMOJI.get(label, LABEL_EMOJI["*"])
+            name  = LABEL_NAMES[PRETTY_LABELS].get(label, LABEL_NAMES[PRETTY_LABELS]["*"])
+            label = f"{emoji} {name}"
         extra = set(filter(None, [raw.get('sub_label'), raw.get('data', {}).get('recognized_license_plate')]))
         extra_display = f" [{' | '.join(sorted(extra))}]" if extra else ""
-        pretty_labels.add(f"{label_info['emoji']} {label_info['name']}{extra_display}")
+        labels.add(f"{label}{extra_display}")
 
-    zone_display = f" в зонах {', '.join(sorted(zones))}" if zones else ""
+    zone_display = f" in {', '.join(sorted(zones))}" if zones else ""
     caption = (
         f"🕒 {_format_time(start_time)} – {_format_time(end_time)}\n"
-        f"{', '.join(sorted(pretty_labels))} at {camera}{zone_display}"
+        f"{', '.join(sorted(labels))} on {camera}{zone_display}"
     )
 
     if review_metadata and review_metadata.get("shortSummary"):
@@ -621,13 +590,16 @@ def _build_caption(raw_events, start_time, end_time, camera, review_id, review_m
     return caption
 
 async def handle_review(payload_json: str):
+    """Handles one frigate/reviews message: on 'end' downloads the snapshots and the clip,
+    encodes the video, fetches detection details and the genai summary, builds the
+    notification and dispatches it to the channels."""
     payload = json.loads(payload_json)
 
     if payload["type"] != "end":
         logger.debug(f"Skipped event type: {payload['type']}")
         return
 
-    logger.info(f"Payload: {payload_json}")
+    logger.debug(f"Payload: {payload_json}")
 
     detections = payload["after"]["data"]["detections"]
     detection_ids = sorted(detections, key=_time_from_id)
@@ -637,50 +609,44 @@ async def handle_review(payload_json: str):
     camera = payload["after"]["camera"]
     review_id = payload["after"]["id"]
     severity = payload["after"].get("severity", "alert")
-    logger.info(f"Новый review: {review_id} (severity: {severity})")
+    logger.info(f"Review {review_id}: severity {severity}, camera {camera}, {len(detection_ids)} detections")
 
     review_dir = f"{CLIP_DIR}/{review_id}"
     os.makedirs(review_dir, exist_ok=True)
 
-    # Сводку review.genai ждём параллельно всей обработке:
-    # Frigate генерирует её после конца активности, видео-пайплайн даёт ей фору
+    # The review.genai summary is awaited in parallel with everything else:
+    # Frigate generates it after the activity ends, so the video pipeline gives it a head start
     summary_task = (asyncio.create_task(_get_review_summary(camera, severity, review_id))
                     if GENAI_REVIEW_SHOW else None)
 
-    start_int = int(start_time) - EXPORT_START_SHIFT
-    end_int = int(end_time) + EXPORT_END_SHIFT
-    if end_int - start_int > EXPORT_MAX_LEN:
-        start_int = end_int - EXPORT_MAX_LEN
+    start_int = int(start_time) - CLIP_START_SHIFT
+    end_int = int(end_time) + CLIP_END_SHIFT
+    if end_int - start_int > CLIP_MAX_LEN:
+        start_int = end_int - CLIP_MAX_LEN
 
-    # Экспорт запрашиваем сразу: Frigate собирает ролик, пока мы качаем снапшоты
-    export_id = await asyncio.to_thread(_request_export, camera, start_int, end_int)
+    # Clip and snapshots are downloaded in parallel
+    raw_clip = os.path.join(review_dir, "clip.mp4")
+    snapshots = [(d, os.path.join(review_dir, f"{d}.jpg")) for d in detection_ids]
+    has_clip, *fetched = await asyncio.gather(
+        asyncio.to_thread(_fetch_clip, camera, start_int, end_int, raw_clip),
+        *(asyncio.to_thread(_fetch_snapshot, d, p) for d, p in snapshots),
+    )
+    photos = [p for (d, p), ok in zip(snapshots, fetched) if ok]
+    logger.info("Review %s: snapshots downloaded %d of %d", review_id, len(photos), len(detection_ids))
 
-    photos, video = [], None
-    try:
-        snapshots = [(d, os.path.join(review_dir, f"{d}.jpg")) for d in detection_ids]
-        fetched = await asyncio.gather(*(asyncio.to_thread(_fetch_snapshot, d, p) for d, p in snapshots))
-        photos = [p for (d, p), ok in zip(snapshots, fetched) if ok]
-        logger.info("Снапшоты: скачано %d из %d", len(photos), len(detection_ids))
-
-        export_path = await _wait_export(export_id) if export_id else None
-        if export_path:
-            video = await _prepare_video(export_path, review_dir)   # dict или None
-    finally:
-        # Экспорт удаляется всегда, даже если обработка упала
-        if export_id:
-            await asyncio.to_thread(_delete_export, export_id)
+    video = await _prepare_video(raw_clip, review_dir) if has_clip else None   # dict or None
 
     raw_events = [r for r in await asyncio.gather(
         *(asyncio.to_thread(_fetch_detection, d) for d in detection_ids)) if r]
 
-    # Сводка review.genai: задача крутилась параллельно с самого начала.
-    # Её сбой не должен стоить алерта — сводка необязательна
+    # review.genai summary: the task has been running since the very beginning.
+    # Its failure must not cost the alert — the summary is optional
     review_metadata = None
     if summary_task:
         try:
             review_metadata = await summary_task
         except Exception:
-            logger.exception(f"{review_id}: сбой задачи сводки review.genai — уведомление уйдёт без неё.")
+            logger.exception(f"Review {review_id}: summary task failed — sending without it")
 
     notification = {
         'review_id': review_id,
@@ -690,30 +656,31 @@ async def handle_review(payload_json: str):
     }
     await dispatch_notification(notification)
 
-# --- БЛОК ДЛЯ ЗАПУСКА ---
+# --- DEBUG RUN ---
+# Manual run for one event: python notifier.py '<json payload>' (uses the *_debug MTProto session)
 if __name__ == "__main__":
     log_config.setup("debug.log")
     if len(sys.argv) < 2:
-        print("Ошибка: Необходимо передать JSON payload.", file=sys.stderr)
+        print("Usage: python notifier.py '<json payload>'", file=sys.stderr)
         sys.exit(1)
 
     payload_from_cli = sys.argv[1]
 
     async def debug_run():
-        logger.info("Запуск в режиме отладки (сессия *_debug)...")
+        logger.info("Debug run started (session *_debug)")
         workers = start_delivery_workers(debug=True)
         try:
             await handle_review(payload_from_cli)
-            await flush_delivery_queues()   # дождаться, пока каналы всё отправят
+            await flush_delivery_queues()   # wait until every channel has sent everything
         finally:
             for t in workers:
                 t.cancel()
-            # даём воркерам корректно закрыться (session() отключает клиента в finally)
+            # let the workers shut down cleanly (session() disconnects the client in its finally)
             await asyncio.gather(*workers, return_exceptions=True)
-        logger.info("Отладочный прогон завершён.")
+        logger.info("Debug run finished")
 
     try:
         asyncio.run(debug_run())
     except Exception:
-        logger.exception("Ошибка во время выполнения handle_review:")
+        logger.exception("Debug run failed")
         sys.exit(1)

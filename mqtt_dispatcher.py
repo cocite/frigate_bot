@@ -1,17 +1,15 @@
 import asyncio
-import logging
 from aiomqtt import Client, MqttError
 import log_config
 from notifier import handle_review, start_delivery_workers, cleanup_worker
 
-# Хендлеры настраивает log_config.setup() в блоке __main__
-logger = logging.getLogger("mqtt_dispatcher")
-logger.setLevel(logging.DEBUG)
+# Handlers are set up by log_config.setup() in __main__; console level comes from config.LOG_LEVEL
+logger = log_config.get_logger("mqtt_dispatcher")
 
-MQTT_QUEUE_SIZE = 100    # сообщений в очереди на топик; при заполнении приём ждёт (backpressure)
+MQTT_QUEUE_SIZE = 100    # messages per topic queue; when full, the MQTT reader waits (backpressure)
 
-# Настройка задач:
-# Каждая задача имеет: топик, обработчик и количество воркеров.
+# Task setup: each task has a topic, a handler and a number of workers.
+# Several tasks may listen to the same topic, each with its own queue.
 tasks_config = [
     #{
     #    "name": "frigate_alert_parallel",
@@ -28,35 +26,37 @@ tasks_config = [
 ]
 
 async def worker(queue: asyncio.Queue, task_name: str, handler, worker_id: int):
-    logger.info(f"[{task_name}] Worker-{worker_id} started.")
+    """Takes messages from the queue and runs the handler; a handler error is logged and does not kill the worker."""
+    logger.info(f"[{task_name}] worker {worker_id} started")
     while True:
         msg = await queue.get()
         topic = str(msg.topic)
         payload = msg.payload.decode('utf-8', errors='ignore')
 
-        logger.debug(f"[{task_name}] Worker-{worker_id} handling '{topic}'.")
         try:
             await handler(payload)
-            logger.info(f"[{task_name}] Worker-{worker_id} successfully handled '{topic}'.")
+            logger.debug(f"[{task_name}] worker {worker_id} finished '{topic}'")
         except Exception:
-            logger.exception(f"[{task_name}] Error handling '{topic}'")
+            logger.exception(f"[{task_name}] handler failed for '{topic}'")
         finally:
             queue.task_done()
 
 async def mqtt_dispatcher(client, queues_by_topic):
+    """Routes incoming MQTT messages to the queues of their topic."""
     async for message in client.messages:
         topic = str(message.topic)
         queues = queues_by_topic.get(topic, [])
         if queues:
             for queue in queues:
                 if queue.full():
-                    logger.warning(f"Очередь '{topic}' заполнена — обработчики не успевают, приём ждёт.")
+                    logger.warning(f"Queue for '{topic}' is full ({queue.qsize()}) — handlers can't keep up, waiting for a slot")
                 await queue.put(message)
-                logger.debug(f"Message on topic '{topic}' enqueued.")
+                logger.debug(f"Message on '{topic}' enqueued")
         else:
-            logger.warning(f"No queues for topic '{topic}'.")
+            logger.warning(f"No handlers for topic '{topic}'")
 
 async def mqtt_client(queues_by_topic):
+    """Keeps the MQTT connection alive: subscribes to all topics and reconnects on errors."""
     reconnect_interval = 5
     topics = set(queues_by_topic.keys())
 
@@ -64,16 +64,16 @@ async def mqtt_client(queues_by_topic):
         try:
             async with Client("mosquitto", port=1883) as client:
                 await client.subscribe([(topic, 0) for topic in topics])
-                logger.info(f"Subscribed to topics: {list(topics)}")
+                logger.info(f"Subscribed to {sorted(topics)}")
 
                 await mqtt_dispatcher(client, queues_by_topic)
 
         except MqttError as e:
-            logger.error(f"MQTT Error '{e}'. Reconnecting in {reconnect_interval}s...")
+            logger.error(f"MQTT error: {e} — reconnecting in {reconnect_interval}s")
             await asyncio.sleep(reconnect_interval)
 
 async def run_dispatcher():
-    """Ядро диспетчера: очереди, воркеры, MQTT-цикл."""
+    """Dispatcher core: queues, workers, MQTT loop."""
     queues_by_topic = {}
     workers_tasks = []
     for task_conf in tasks_config:
@@ -87,14 +87,14 @@ async def run_dispatcher():
 
     mqtt_task = asyncio.create_task(mqtt_client(queues_by_topic))
 
-    logger.info("MQTT диспетчер запущен. Ожидание сообщений...")
+    logger.info("Dispatcher started, waiting for messages")
     await asyncio.gather(mqtt_task, *workers_tasks)
 
 async def main():
-    """Entry point: MQTT-диспетчер, воркеры доставки каналов, периодическая уборка.
-    Жизненным циклом клиентов (сессия MTProto) владеют сами воркеры каналов.
-    Всё в одном gather: смерть любой задачи роняет процесс с traceback'ом
-    (compose перезапустит), а не остаётся незамеченной."""
+    """Entry point: MQTT dispatcher, channel delivery workers, periodic cleanup.
+    Client lifecycles (the MTProto session) are owned by the channel workers themselves.
+    Everything in one gather: if any task dies, the process crashes with a traceback
+    (compose restarts it) instead of failing silently."""
     await asyncio.gather(
         run_dispatcher(),
         cleanup_worker(),
@@ -106,4 +106,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("MQTT Dispatcher stopped manually.")
+        logger.info("Dispatcher stopped (Ctrl+C)")

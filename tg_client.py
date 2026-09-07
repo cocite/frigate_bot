@@ -1,37 +1,37 @@
 """
-Единственный владелец Telethon-клиента.
+Sole owner of the Telethon client.
 
-Правило: сессию открывает воркер канала TG_MTPROTO — session() указан как
-lifecycle канала в CHANNELS и живёт, пока жив воркер. Транспорт берёт клиент
-через 'await tg_client.ensure()'.
+Rule: the session is opened by the TG_MTPROTO channel worker — session() is the
+channel's lifecycle in CHANNELS and lives as long as the worker. The transport gets
+the client via 'await tg_client.ensure()'.
 
-Неавторизованная сессия сервис не роняет: он работает без MTProto,
-а ensure() пробует подключиться заново при каждой отправке — создал
-сессию, и следующий алерт уйдёт уже через MTProto, без рестарта.
+An unauthorized session does not bring the service down: it runs without MTProto,
+and ensure() retries the connection on every send — create the session, and the
+next alert goes through MTProto without a restart.
 
-Создание сессии (интерактивно спросит телефон и код):
-  боевая:  docker compose exec -it frigate_bot python tg_client.py
-  debug:   docker compose exec -it frigate_bot python tg_client.py --debug
+Creating a session (asks for the phone number, the code and the 2FA password interactively):
+  production: docker compose exec -it frigate_bot python tg_client.py
+  debug:      docker compose exec -it frigate_bot python tg_client.py --debug
 """
 import os
 import sys
 import asyncio
-import logging
 from contextlib import asynccontextmanager
 
 from telethon import TelegramClient
+import log_config
 from config import TG_MTPROTO_CONFIG
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-logger = logging.getLogger(__name__)
+logger = log_config.get_logger(__name__)
 
 _client = None
-_session = None  # имя сессии; не None = session() открыт и MTPROTO включён
+_session = None  # session name; not None = session() is open (the TG_MTPROTO channel is enabled)
 
 
 class NotAuthorized(RuntimeError):
-    """Ожидаемое состояние «сессия ещё не создана» — логируется без traceback."""
+    """Expected state "session not created yet" — logged without a traceback."""
 
 
 def _session_name(debug: bool) -> str:
@@ -49,64 +49,63 @@ def _build(name: str) -> TelegramClient:
 
 
 async def _connect(name: str) -> TelegramClient:
-    """Подключает авторизованную сессию или кидает RuntimeError с подсказкой.
-    connect + явная проверка вместо client.start(): start() при отсутствующей
-    сессии интерактивно спросит телефон через input() — в контейнере это зависание."""
+    """Connects an authorized session or raises NotAuthorized with a hint.
+    connect + explicit check instead of client.start(): with no session start() asks
+    for the phone number via input(), which hangs in a container."""
     client = _build(name)
     await client.connect()
     if not await client.is_user_authorized():
         await client.disconnect()
         raise NotAuthorized(
-            f"Telethon-сессия '{name}' не авторизована. Создайте её:\n"
-            "  боевая:  docker compose exec -it frigate_bot python tg_client.py\n"
-            "  debug:   docker compose exec -it frigate_bot python tg_client.py --debug"
+            f"MTProto session '{name}' is not authorized. Create it:\n"
+            "  production: docker compose exec -it frigate_bot python tg_client.py\n"
+            "  debug:      docker compose exec -it frigate_bot python tg_client.py --debug"
         )
     return client
 
 
 async def ensure() -> TelegramClient:
-    """Возвращает подключённый клиент. Если его нет — пробует подключиться
-    прямо сейчас: вдруг сессию уже создали, пока сервис работал."""
+    """Returns the connected client. If there is none, tries to connect right now:
+    the session may have been created while the service was running."""
     global _client
     if _client is not None:
         return _client
     if _session is None:
         raise RuntimeError(
-            "MTProto вне сессии: ensure() вызван не из воркера канала "
-            "TG_MTPROTO (lifecycle не открыт)."
+            "MTProto client requested outside a session: "
+            "ensure() must run inside the TG_MTPROTO worker"
         )
     _client = await _connect(_session)
-    logger.info("Telethon-сессия '%s' подключена.", _session)
+    logger.info("MTProto session '%s' connected", _session)
     return _client
 
 
 @asynccontextmanager
 async def session(debug: bool = False):
-    """Открывает MTProto-сессию на время блока (lifecycle канала TG_MTPROTO)."""
+    """Opens the MTProto session for the duration of the block (lifecycle of the TG_MTPROTO channel)."""
     global _client, _session
     _session = _session_name(debug)
     try:
         await ensure()
     except Exception as e:
-        # Любой сбой при старте (нет сессии, нет сети, залочен файл) — не смертелен:
-        # ensure() переподключится при первой же отправке
-        logger.warning("MTProto пока недоступен (%s): %s", type(e).__name__, e)
-        logger.warning("Продолжаю без MTProto — буду пробовать подключиться при каждой отправке.")
+        # Any startup failure (no session, no network, locked session file) is not fatal:
+        # ensure() reconnects on the first send
+        logger.warning("MTProto unavailable at startup (%s): %s — continuing without it, will retry on every send",
+                       type(e).__name__, e)
 
     try:
         yield
     finally:
-        # Закрываем клиента, существующего на момент выхода:
-        # он мог появиться и позже, через ensure() при отправке
+        # Close the client that exists at exit time:
+        # it may have appeared later, via ensure() during a send
         client, _client, _session = _client, None, None
         if client and client.is_connected():
             await client.disconnect()
-            logger.info("Telethon-сессия отключена.")
+            logger.info("MTProto session disconnected")
 
 
 if __name__ == "__main__":
-    # Интерактивное создание сессии: телефон, код, пароль 2FA — файл сохранится рядом.
-    import log_config
+    # Interactive session creation: phone number, code, 2FA password — the session file is saved next to this module
     log_config.setup("debug.log")
     name = _session_name(debug='--debug' in sys.argv)
     client = _build(name)
@@ -114,7 +113,7 @@ if __name__ == "__main__":
     async def _login():
         await client.start()
         me = await client.get_me()
-        print(f"Сессия '{name}' авторизована как: {me.first_name} (id={me.id})")
+        logger.info("Session '%s' authorized as %s (id=%s)", name, me.first_name, me.id)
         await client.disconnect()
 
     asyncio.run(_login())

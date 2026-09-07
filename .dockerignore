@@ -1,8 +1,8 @@
-# Логи (большие и меняются постоянно — ломают кеш сборки)
+# Logs (large and constantly changing — they break the build cache)
 *.log
 *.log.*
 
-# Сессии Telethon (в образе им не место, придут через bind mount)
+# Telethon sessions (do not belong in the image, they come via the bind mount)
 *.session
 *.session-journal
 
@@ -10,13 +10,13 @@
 __pycache__/
 *.pyc
 
-# Мусор
+# macOS
 .DS_Store
 
-# Данные рантайма (снапшоты, видео)
+# Runtime data (snapshots, videos)
 data/
 
-# Сборочные файлы
+# Build files
 Dockerfile
 .dockerignore
 .gitignore

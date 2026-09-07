@@ -2,8 +2,8 @@ FROM python:3.11-slim-trixie
 
 WORKDIR /app
 
-# ffmpeg + VAAPI-драйвер + диагностика (всё из main, доп. репозитории не нужны;
-# проверено: свободный intel-media-va-driver даёт полный набор энкодеров на нашем GPU)
+# ffmpeg + VAAPI driver + diagnostics, all from Debian main (no extra repos).
+# The free intel-media-va-driver is enough for h264_vaapi on an Intel iGPU, the non-free variant is not needed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg \
       intel-media-va-driver \

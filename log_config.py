@@ -1,15 +1,20 @@
 """
-Единая настройка логирования.
+Single logging setup.
 
-Entry point вызывает один раз:
+The entry point calls once:
     log_config.setup("frigate_bot.log")
-Модули хендлеры не трогают — только logger = logging.getLogger(__name__)
-(и setLevel(DEBUG) у себя, если нужны debug-строки).
+Modules get their logger via log_config.get_logger(__name__).
+The file gets everything (DEBUG); the console (docker logs) follows config.LOG_LEVEL.
 """
 import logging
 import logging.handlers
 import os
 import sys
+
+from config import LOG_LEVEL
+
+if LOG_LEVEL not in ('DEBUG', 'INFO', 'WARNING', 'ERROR'):
+    raise ValueError(f"LOG_LEVEL={LOG_LEVEL!r}: must be one of DEBUG / INFO / WARNING / ERROR")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -19,7 +24,7 @@ FORMAT = '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
 
 
 def setup(log_filename):
-    """Настраивает root-логгер: ротируемый файл + stderr. Повторный вызов — no-op."""
+    """Configures the root logger: rotating file + stderr. A repeated call is a no-op."""
     root = logging.getLogger()
     if root.handlers:
         return
@@ -33,12 +38,20 @@ def setup(log_filename):
 
     console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setFormatter(formatter)
+    console_handler.setLevel(LOG_LEVEL)      # console follows config.LOG_LEVEL, the file always gets everything
 
-    # root на INFO: debug-шум библиотек (urllib3 и пр.) отсекается сам,
-    # а наши модули включают себе DEBUG локально через setLevel.
+    # root at INFO: library debug noise (urllib3, aiomqtt, ...) is cut off by itself;
+    # our modules are at DEBUG via get_logger(), their records are filtered by the handlers.
     root.setLevel(logging.INFO)
     root.addHandler(file_handler)
     root.addHandler(console_handler)
 
-    # Болтливые библиотеки — только предупреждения
+    # Chatty libraries — warnings only
     logging.getLogger('telethon').setLevel(logging.WARNING)
+
+
+def get_logger(name):
+    """Module logger: passes everything down to DEBUG, the handlers filter from there."""
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    return logger
