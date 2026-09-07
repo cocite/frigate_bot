@@ -1,6 +1,4 @@
-# frigate_bot
-
-> Written with AI assistance — some parts may be overly detailed, others missing. A proper README is in progress.
+# Frigate Notify Bot
 
 Telegram notifications for [Frigate NVR](https://frigate.video). For every finished event (Frigate *review item*) you get one message with:
 
