@@ -40,7 +40,7 @@ git clone https://github.com/cocite/frigate_bot.git
 cp frigate_bot/config.example.py frigate_bot/config.py
 ```
 
-Fill in the credentials of the channel you use and enable it in `ENABLED_CHANNELS` — the template explains every field.
+Fill in the credentials of the channel you use and enable it in `ENABLED_CHANNELS` — the template explains every field. The block of the other channel can be deleted.
 
 **3. Add the service** to your Frigate `docker-compose.yaml`:
 

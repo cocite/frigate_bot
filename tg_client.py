@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 
 from telethon import TelegramClient
 import log_config
-from config import TG_MTPROTO_CONFIG
+import config
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -35,14 +35,14 @@ class NotAuthorized(RuntimeError):
 
 
 def _session_name(debug: bool) -> str:
-    return TG_MTPROTO_CONFIG['session_name'] + ('_debug' if debug else '')
+    return config.TG_MTPROTO_CONFIG['session_name'] + ('_debug' if debug else '')
 
 
 def _build(name: str) -> TelegramClient:
     return TelegramClient(
         os.path.join(BASE_DIR, name),
-        TG_MTPROTO_CONFIG['api_id'],
-        TG_MTPROTO_CONFIG['api_hash'],
+        config.TG_MTPROTO_CONFIG['api_id'],
+        config.TG_MTPROTO_CONFIG['api_hash'],
         connection_retries=10,
         retry_delay=5,
     )

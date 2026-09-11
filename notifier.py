@@ -10,7 +10,8 @@ from telethon.tl.types import InputMediaUploadedPhoto, InputMediaUploadedDocumen
 import log_config
 import tg_client
 from pretty_labels import LABEL_EMOJI, LABEL_NAMES
-from config import (ENABLED_CHANNELS, TG_BOT_CONFIG, TG_MTPROTO_CONFIG, FRIGATE_PUBLIC_URL, PRETTY_LABELS,
+import config
+from config import (ENABLED_CHANNELS, FRIGATE_PUBLIC_URL, PRETTY_LABELS,
                     GENAI_REVIEW_SHOW, GENAI_REVIEW_WAIT, GENAI_REVIEW_POLL,
                     CLIP_START_SHIFT, CLIP_END_SHIFT, CLIP_MAX_LEN,
                     OUTPUT_WIDTH, OUTPUT_FPS, OUTPUT_QP)
@@ -325,7 +326,7 @@ def messenger_style(notification, params):
 def _send_bot_api_request(method, data, file_paths=None, max_retries=5):
     """(Bot API) Sends a request. Returns the successful response or raises RuntimeError.
     Retries on rate limit (429), Telegram errors (5xx) and network failures."""
-    url = f"https://api.telegram.org/bot{TG_BOT_CONFIG['token']}/{method}"
+    url = f"https://api.telegram.org/bot{config.TG_BOT_CONFIG['token']}/{method}"
     for _ in range(max_retries):
         files = {name: open(path, 'rb') for name, path in file_paths.items()} if file_paths else None
         try:
@@ -376,7 +377,7 @@ async def _deliver_bot(msg):
     """(Bot API) Sends one channel message."""
     if msg['kind'] == 'text':
         await asyncio.to_thread(_send_bot_api_request, "sendMessage",
-                                data={"chat_id": TG_BOT_CONFIG['chat_id'], "text": msg['text']})
+                                data={"chat_id": config.TG_BOT_CONFIG['chat_id'], "text": msg['text']})
         return
 
     items = msg['items']
@@ -384,7 +385,7 @@ async def _deliver_bot(msg):
         # sendMediaGroup requires 2–10 items — a single media item goes through its own method (sendPhoto / sendVideo)
         item = items[0]
         field = "photo" if item['type'] == 'photo' else "video"
-        data, files = {"chat_id": TG_BOT_CONFIG['chat_id']}, {}
+        data, files = {"chat_id": config.TG_BOT_CONFIG['chat_id']}, {}
         attach_name = _bot_media_fields(item, data, files)
         data[field] = f"attach://{attach_name}"
         if msg['caption']:
@@ -401,7 +402,7 @@ async def _deliver_bot(msg):
         media_payload.append(payload_item)
     if msg['caption']:
         media_payload[-1]['caption'] = msg['caption']
-    data = {"chat_id": TG_BOT_CONFIG['chat_id'], "media": json.dumps(media_payload)}
+    data = {"chat_id": config.TG_BOT_CONFIG['chat_id'], "media": json.dumps(media_payload)}
     await asyncio.to_thread(_send_bot_api_request, "sendMediaGroup", data=data, file_paths=files_to_attach)
 
 async def _mtproto_send_media_group(client, chat_id, media_objects, caption=""):
@@ -431,7 +432,7 @@ async def _deliver_mtproto(msg):
     client = await tg_client.ensure()
 
     if msg['kind'] == 'text':
-        await asyncio.wait_for(client.send_message(TG_MTPROTO_CONFIG['chat_id'], msg['text']), timeout=30)
+        await asyncio.wait_for(client.send_message(config.TG_MTPROTO_CONFIG['chat_id'], msg['text']), timeout=30)
         return
 
     # Uploads are not time-limited: a slow network is not a failure, and a dead one
@@ -450,12 +451,13 @@ async def _deliver_mtproto(msg):
                 DocumentAttributeVideo(duration=meta.get('duration'), w=meta.get('width'), h=meta.get('height'), supports_streaming=True),
                 DocumentAttributeFilename(file_name=os.path.basename(item['path']))]
             media_objects.append(InputMediaUploadedDocument(file=video_handle, thumb=thumb_handle, attributes=attributes, mime_type='video/mp4'))
-    await _mtproto_send_media_group(client, TG_MTPROTO_CONFIG['chat_id'], media_objects, msg['caption'])
+    await _mtproto_send_media_group(client, config.TG_MTPROTO_CONFIG['chat_id'], media_objects, msg['caption'])
 
 # Channel registry. tag — log label; formatter + format_params — how a notification
 # becomes messages; transport — how a message is sent; lifecycle (optional) — async
 # context manager the delivery worker opens for its lifetime (MTProto session).
-# A channel is active when its name is in ENABLED_CHANNELS and <NAME>_CONFIG exists in config.py.
+# A channel is active when its name is in ENABLED_CHANNELS; its <NAME>_CONFIG must exist in config.py
+# (checked below), the config of a disabled channel may be absent.
 CHANNELS = {
     'TG_BOT': {
         'tag': 'TG:BotAPI',                 # channel tag in logs
@@ -475,6 +477,13 @@ CHANNELS = {
                               video_in_album=True),
     },
 }
+
+# Every enabled channel must exist and have its <NAME>_CONFIG in config.py
+for _channel in ENABLED_CHANNELS:
+    if _channel not in CHANNELS:
+        raise ValueError(f"Unknown channel '{_channel}' in ENABLED_CHANNELS (available: {list(CHANNELS)})")
+    if not hasattr(config, f"{_channel}_CONFIG"):
+        raise ValueError(f"{_channel} is in ENABLED_CHANNELS but {_channel}_CONFIG is missing in config.py")
 
 # --- 7. DELIVERY QUEUES ---
 
@@ -524,9 +533,6 @@ def start_delivery_workers(debug=False):
     Called by the entry point; keep the returned tasks referenced, otherwise they can be garbage-collected."""
     tasks = []
     for channel in ENABLED_CHANNELS:
-        if channel not in CHANNELS:
-            logger.error(f"Unknown channel '{channel}' in ENABLED_CHANNELS — skipped")
-            continue
         _delivery_queues[channel] = asyncio.Queue(maxsize=DELIVERY_QUEUE_SIZE)
         tasks.append(asyncio.create_task(_delivery_worker(channel, debug), name=f"delivery-{channel}"))
     return tasks

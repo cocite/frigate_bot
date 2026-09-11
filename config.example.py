@@ -5,7 +5,7 @@ Copy to config.py and fill in:  cp config.example.py config.py
 
 # --- DELIVERY CHANNELS ---
 # Available: TG_BOT (Telegram Bot API), TG_MTPROTO (Telegram user account, videos up to 2 GB)
-# Uncomment the one you need
+# Uncomment the one you need; the config block of a channel you do not use can be deleted
 ENABLED_CHANNELS = ['TG_BOT']
 # ENABLED_CHANNELS = ['TG_MTPROTO']
 # ENABLED_CHANNELS = ['TG_BOT', 'TG_MTPROTO']
