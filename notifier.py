@@ -23,7 +23,6 @@ CLEANUP_INTERVAL = 3600           # how often old media in CLIP_DIR is cleaned u
 
 # Telegram delivery (per-channel format params are in CHANNELS, section 6)
 BOT_API_TIMEOUT = 300             # Bot API socket timeout (connect/write/read), seconds
-DELIVERY_QUEUE_SIZE = 30          # messages per channel delivery queue
 
 # Frigate API
 FRIGATE_URL = "http://frigate:5000"
@@ -487,8 +486,8 @@ for _channel in ENABLED_CHANNELS:
 
 # --- 7. DELIVERY QUEUES ---
 
-# Delivery queues: one per enabled channel, each channel drains its own at its own pace —
-# a slow channel never delays a fast one
+# Unbounded delivery queues: one per enabled channel, so enqueueing never waits for
+# a slow channel. Only message metadata and file paths are queued; media stays on disk.
 _delivery_queues = {}
 
 def _describe(msg):
@@ -506,9 +505,10 @@ async def _delivery_loop(channel):
     logger.info(f"[{tag}] delivery worker started")
     while True:
         review_id, msg = await q.get()
-        logger.info(f"[{tag}] {review_id}: sending {_describe(msg)}, queue {q.qsize()}")
         started = time.monotonic()
         try:
+            # inside try: a stale message whose media was already cleaned up must fail like any other
+            logger.info(f"[{tag}] {review_id}: sending {_describe(msg)}, queue {q.qsize()}")
             await transport(msg)
             logger.info(f"[{tag}] {review_id}: {msg['kind']} delivered in {time.monotonic() - started:.1f} s, queue {q.qsize()}")
         except tg_client.NotAuthorized as e:
@@ -533,7 +533,7 @@ def start_delivery_workers(debug=False):
     Called by the entry point; keep the returned tasks referenced, otherwise they can be garbage-collected."""
     tasks = []
     for channel in ENABLED_CHANNELS:
-        _delivery_queues[channel] = asyncio.Queue(maxsize=DELIVERY_QUEUE_SIZE)
+        _delivery_queues[channel] = asyncio.Queue()
         tasks.append(asyncio.create_task(_delivery_worker(channel, debug), name=f"delivery-{channel}"))
     return tasks
 
@@ -555,10 +555,8 @@ async def dispatch_notification(notification):
         except Exception:
             logger.exception(f"[{tag}] {rid}: formatter failed — event skipped")
             continue
-        if q.full():
-            logger.warning(f"[{tag}] queue is full ({q.qsize()}) — channel can't keep up, waiting for a slot")
         for msg in messages:
-            await q.put((rid, msg))
+            q.put_nowait((rid, msg))
         logger.info(f"[{tag}] {rid}: {len(messages)} messages enqueued, queue {q.qsize()}")
 
 # --- 8. REVIEW HANDLER ---
