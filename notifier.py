@@ -185,7 +185,9 @@ def _check_clip(path, expected_duration):
             capture_output=True, text=True, check=True, timeout=5,
         )
         streams = json.loads(result.stdout)["streams"]
-        video = next(s for s in streams if s["codec_type"] == "video")
+        video = next((s for s in streams if s["codec_type"] == "video"), None)
+        if video is None:
+            raise ValueError("video stream missing")
         limit = expected_duration + 10  # allow segment/keyframe padding
         if not 1 < float(video["duration"]) <= limit:
             raise ValueError("suspicious video duration")
@@ -197,8 +199,7 @@ def _check_clip(path, expected_duration):
             if not (-10 <= start <= limit and 0 < duration <= limit - start):
                 raise ValueError(f"invalid {stream['codec_type']} timeline")
         return True
-    except (OSError, subprocess.SubprocessError, ValueError, TypeError,
-            KeyError, StopIteration) as e:
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError) as e:
         logger.error("Clip check failed — sending without video: %s (requested %d s, streams %s): %s",
                      path, expected_duration, streams, getattr(e, "stderr", None) or e)
         return False
