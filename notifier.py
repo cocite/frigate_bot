@@ -173,6 +173,36 @@ def _find_vaapi_device():
         logger.warning("Intel VAAPI not found — encoding on CPU (libx264)")
     return device
 
+def _check_clip(path, expected_duration):
+    """Sanity check of the downloaded clip: Frigate occasionally returns clips with broken
+    audio/video timestamps (concatenation of segments with a degenerate audio track).
+    Returns True if the timeline looks sane."""
+    streams = []
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,start_time,duration", "-of", "json", path],
+            capture_output=True, text=True, check=True, timeout=5,
+        )
+        streams = json.loads(result.stdout)["streams"]
+        video = next(s for s in streams if s["codec_type"] == "video")
+        limit = expected_duration + 10  # allow segment/keyframe padding
+        if not 1 < float(video["duration"]) <= limit:
+            raise ValueError("suspicious video duration")
+        for stream in streams:
+            if stream["codec_type"] not in ("video", "audio"):
+                continue
+            start = float(stream.get("start_time", 0))
+            duration = float(stream["duration"])
+            if not (-10 <= start <= limit and 0 < duration <= limit - start):
+                raise ValueError(f"invalid {stream['codec_type']} timeline")
+        return True
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError,
+            KeyError, StopIteration) as e:
+        logger.error("Clip check failed — sending without video: %s (requested %d s, streams %s): %s",
+                     path, expected_duration, streams, getattr(e, "stderr", None) or e)
+        return False
+
 async def _prepare_video(source_path, review_dir):
     """Compresses the clip (VAAPI or CPU), extracts a thumbnail and metadata.
     Returns a media item for sending or None."""
@@ -638,7 +668,10 @@ async def handle_review(payload_json: str):
     photos = [p for (d, p), ok in zip(snapshots, fetched) if ok]
     logger.info("Review %s: snapshots downloaded %d of %d", review_id, len(photos), len(detection_ids))
 
-    video = await _prepare_video(raw_clip, review_dir) if has_clip else None   # dict or None
+    clip_ok = has_clip and await asyncio.to_thread(
+        _check_clip, raw_clip, end_int - start_int,
+    )
+    video = await _prepare_video(raw_clip, review_dir) if clip_ok else None   # dict or None
 
     raw_events = [r for r in await asyncio.gather(
         *(asyncio.to_thread(_fetch_detection, d) for d in detection_ids)) if r]

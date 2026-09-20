@@ -168,8 +168,6 @@ Adding a channel = a formatter (or reusing `messenger_style` with other params),
 
 The files always contain everything, including DEBUG; `LOG_LEVEL` in `config.py` only sets what goes to the console (`docker compose logs`).
 
-Every event is logged with its review id, so `grep <review_id> frigate_bot.log` shows its whole path: snapshots, clip, encoding, summary, and delivery per channel.
-
 ### Debugging
 
 Run the handler for one event directly, without MQTT — take the payload from the log (`Payload: {...}` lines):
